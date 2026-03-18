@@ -1,0 +1,20 @@
+[package]
+name = "deriv-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "deriv-bot"
+path = "src/main.rs"
+
+[dependencies]
+bot_core = { path = "../bot_core" }
+engines = { path = "../engines" }
+connectors = { path = "../connectors" }
+runtime = { path = "../runtime" }
+
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"

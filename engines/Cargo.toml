@@ -1,0 +1,8 @@
+[package]
+name = "engines"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bot_core = { path = "../bot_core" }
+serde_json = "1.0.149"

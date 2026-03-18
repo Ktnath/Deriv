@@ -1,0 +1,39 @@
+[package]
+name = "deriv-bot"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "deriv-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+tokio-tungstenite = { version = "0.21.0", features = ["native-tls"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+
+# Serialization & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+dotenvy = "0.15"
+
+# Web Server (Dashboard telemetry)
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Error handling & Retry
+anyhow = "1.0"
+thiserror = "1.0"
+backoff = { version = "0.4", features = ["tokio"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Internal
+bot_core = { path = "bot_core" }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+chrono = "0.4.44"

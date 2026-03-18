@@ -1,0 +1,40 @@
+# Rust
+target/
+target2/
+**/*.rs.bk
+
+# Environment files
+.env
+.env.*
+
+# Logs and outputs
+*.log
+*.txt
+*.err
+*out.txt
+*err.txt
+*latest.log
+*events.log
+*diag.log
+*clean.log
+*check.log
+*verify.log
+*startup.log
+*trades.log
+*status.log
+*tp.txt
+
+# Databases and heavy data
+*.csv
+*.db
+*.onnx
+*.zip
+*.parquet
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

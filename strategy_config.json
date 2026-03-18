@@ -1,0 +1,25 @@
+{
+    "rsi": {
+        "period": 14,
+        "overbought": 70.0,
+        "oversold": 30.0
+    },
+    "bb": {
+        "period": 20,
+        "num_std": 2.0
+    },
+    "macd": {
+        "fast": 12,
+        "slow": 26,
+        "signal": 9
+    },
+    "late_cycle": {
+        "threshold_1": 0.10,
+        "threshold_2": 0.20,
+        "threshold_3": 0.15
+    },
+    "mtf_playbook": {
+        "threshold_1": 0.10,
+        "threshold_2": 0.20
+    }
+}
