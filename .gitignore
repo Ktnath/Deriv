@@ -38,3 +38,8 @@ target2/
 # OS
 .DS_Store
 Thumbs.db
+
+.temp/
+tmp/
+target/
+node_modules/
