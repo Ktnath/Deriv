@@ -5,10 +5,23 @@ use deriv_bot::{
     execution::trader::{PocAction, Trader},
     market_data::ticks::TickBuffer,
     observability::{db::TelemetryDb, events, metrics::Metrics},
-    protocol::{self, responses::{parse_response, DerivResponse}},
-    risk::{alpha::AlphaEngine, kelly::KellyRisk, ledger::Ledger, limits::RiskGate, settlement::Settlement},
+    protocol::{
+        self,
+        responses::{parse_response, DerivResponse},
+    },
+    risk::{
+        alpha::{AlphaEngine, ModelMode},
+        kelly::KellyRisk,
+        ledger::Ledger,
+        limits::RiskGate,
+        prior::{PriorEngine, PriorMode},
+        settlement::Settlement,
+    },
     strategy::{Signal, StrategyEngine},
-    transport::{router::Router, ws_client::{self, WsClient}},
+    transport::{
+        router::Router,
+        ws_client::{self, WsClient},
+    },
     types::*,
 };
 
@@ -24,17 +37,17 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Load config
     let cfg = BotConfig::from_env();
-    info!(
-        symbol = %cfg.symbol, strategy = ?cfg.strategy,
-        duration = cfg.contract_duration, dry_run = cfg.dry_run,
-        "╔══════════════════════════════════════╗"
-    );
-    info!("║       DERIV TRADING BOT v0.2.1      ║");
-    info!("╚══════════════════════════════════════╝");
-    info!(
-        stop_loss = format!("{:.0}%", cfg.stop_loss_pct * 100.0),
-        "Stop-Loss enabled (Trades will hold to expiry otherwise)"
-    );
+    let prior_engine = PriorEngine::new(cfg.market_prior);
+    let mut alpha = AlphaEngine::new(0.55, cfg.model_path.as_deref(), cfg.allow_model_fallback)?;
+    let model_mode = match alpha.model_mode() {
+        ModelMode::Onnx { path } => format!("onnx:{path}"),
+        ModelMode::QuantOnly { reason } => format!("quant-only:{reason}"),
+    };
+    let prior_mode = match prior_engine.mode() {
+        PriorMode::ModelOnly => "model_only".to_string(),
+        PriorMode::Fixed(prob) => format!("fixed:{:.4}", prob.0),
+    };
+    info!(symbol = %cfg.symbol, strategy = ?cfg.strategy, duration = cfg.contract_duration, duration_unit = %cfg.duration_unit, dry_run = cfg.dry_run, model_mode = %model_mode, model_path = ?cfg.model_path, allow_model_fallback = cfg.allow_model_fallback, prior_mode = %prior_mode, max_open_positions = cfg.max_open_positions, max_daily_loss = cfg.max_daily_loss, cooldown_ms = cfg.cooldown_after_loss_ms, max_consecutive_losses = cfg.max_consecutive_losses, min_stake = cfg.min_stake, stake_sizing_mode = "kelly_live", early_exit_loss_threshold_pct = cfg.stop_loss_pct * 100.0, "Startup configuration loaded");
 
     // 8.5. Spawn Axum Telemetry Server (once, survives reconnects)
     let (telemetry_tx, _telemetry_rx) = tokio::sync::broadcast::channel::<String>(100);
@@ -44,12 +57,10 @@ async fn main() -> anyhow::Result<()> {
     // Initialize persistent engines (survive reconnects)
     let mut tick_buf = TickBuffer::new(1000);
     let mut settlement = Settlement::new();
-    let mut alpha = AlphaEngine::new(0.55);
     let kelly = KellyRisk {
         max_fraction: 0.15,
-        global_cap: cfg.initial_balance,
         max_loss: cfg.initial_balance * 0.5,
-        min_stake: 0.35,
+        min_stake: cfg.min_stake,
     };
     let mut strat = StrategyEngine::new(cfg.strategy);
     let mut ledger = Ledger::new(cfg.initial_balance);
@@ -76,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
     let mut contract_start: Option<i64> = None;
     let mut last_trade_time = 0i64;
     let mut last_metrics_log = 0i64;
-    let q_mkt_up: f64 = 0.5;
 
     // ═══════════════════════════════════════════════
     // Outer reconnection loop
@@ -194,14 +204,14 @@ async fn main() -> anyhow::Result<()> {
                             let Some(s_hat) = est.s_hat_t else { continue; };
 
                             let q_model = alpha.calculate_q_model(s0, s_hat, time_left);
-                            let alpha_out = alpha.shrink_logit(q_model, Prob(q_mkt_up), 0.55);
-                            let risk_dec = kelly.size(alpha_out.q_low, Price(0.50), 0.5);
+                            let alpha_out = alpha.finalize_probability(q_model, prior_engine.current_prior(), 0.55);
+                            let risk_dec = kelly.size(alpha_out.q_low, Price(0.50), 0.5, risk_gate.balance);
 
                             // Strategy signal
                             let signal = strat.generate_signal(&alpha_out, &risk_dec, time_left);
 
                             if let Some(ref db) = db {
-                                let _ = db.insert_alpha_signal(now.0, Some(q_model.0), Some(q_mkt_up), alpha_out.q_low.0, time_left);
+                                let _ = db.insert_alpha_signal(now.0, Some(q_model.0), prior_engine.current_prior().map(|p| p.0), alpha_out.q_low.0, time_left);
                             }
 
                             // Broadcast telemetry
@@ -220,26 +230,31 @@ async fn main() -> anyhow::Result<()> {
                                 if trader.is_idle() {
                                     let can = risk_gate.can_trade(now);
                                     if can.is_ok() && (now.0 - last_trade_time) > (cfg.contract_duration as i64 * 1000) {
-                                    // Dynamic stake: 5% of current balance, rounded to 2 decimals
-                                    let stake_val = ((risk_gate.balance * 0.05 * 100.0).floor() / 100.0)
-                                        .max(0.35);        // Deriv minimum stake
-                                        match trader.enter_trade(
-                                            &SymbolId(cfg.symbol.clone()), ct,
-                                            stake_val, cfg.contract_duration, &cfg.duration_unit,
-                                        ).await {
-                                            Ok(()) => {
-                                                metrics.inc_trades();
-                                                risk_gate.on_trade_opened();
-                                                ledger.on_buy(ct, stake_val);
-                                                last_trade_time = now.0;
-                                            }
-                                            Err(e) => {
-                                                error!(error = %e, "Trade execution failed");
-                                                trader.reset();
+                                        let edge = alpha_out.q_final.0 - 0.5;
+                                        let proposed_stake = risk_dec.max_size.0;
+                                        let executed_stake = proposed_stake;
+                                        if executed_stake < cfg.min_stake {
+                                            info!(predicted_probability = alpha_out.q_final.0, edge, proposed_stake, executed_stake, min_stake = cfg.min_stake, rejection = "below_min_stake", "Trade rejected by stake sizing");
+                                        } else {
+                                            info!(predicted_probability = alpha_out.q_final.0, edge, proposed_stake, executed_stake, min_stake = cfg.min_stake, contract_type = %ct, "Trade passed live stake sizing");
+                                            match trader.enter_trade(
+                                                &SymbolId(cfg.symbol.clone()), ct,
+                                                executed_stake, cfg.contract_duration, &cfg.duration_unit,
+                                            ).await {
+                                                Ok(()) => {
+                                                    metrics.inc_trades();
+                                                    risk_gate.on_trade_opened();
+                                                    ledger.on_buy(ct, executed_stake);
+                                                    last_trade_time = now.0;
+                                                }
+                                                Err(e) => {
+                                                    error!(error = %e, predicted_probability = alpha_out.q_final.0, edge, proposed_stake, executed_stake, "Trade execution failed");
+                                                    trader.reset();
+                                                }
                                             }
                                         }
                                     } else if let Err(rej) = can {
-                                        debug!(rejection = %rej, "Risk gate blocked trade");
+                                        debug!(rejection = %rej, predicted_probability = alpha_out.q_final.0, edge = alpha_out.q_final.0 - 0.5, proposed_stake = risk_dec.max_size.0, executed_stake = 0.0, "Risk gate blocked trade");
                                     }
                                 }
                             }
@@ -293,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
                                         ledger.on_settle(ct, 0.0, stake);
                                     }
                                     trader.reset();
-                                    info!(contract_id = %cid, pnl, "Contract sold early (SL)");
+                                    info!(contract_id = %cid, pnl, "Contract sold early after early-exit loss threshold");
                                 }
                                 PocAction::Settled(pnl) => {
                                     let now = UnixMs::now();

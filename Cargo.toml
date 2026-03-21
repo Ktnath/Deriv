@@ -37,3 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 bot_core = { path = "bot_core" }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 chrono = "0.4.44"
+
+[dev-dependencies]
+tempfile = "3"
