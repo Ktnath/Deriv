@@ -284,13 +284,24 @@ fn report(db: &TelemetryDb, run_id: Option<&str>) -> anyhow::Result<()> {
 
 fn print_report(db: &TelemetryDb, run_id: &str) -> anyhow::Result<()> {
     let summary = db.latest_run_report(run_id)?;
-    let (wins, losses, pnl) = db.win_loss_summary(run_id)?;
+    let outcomes = db.trade_outcome_summary(run_id)?;
     println!("report run_id={run_id}");
     println!(
         "  decisions={} signal_intents={} trades={} avg_edge={:.5} pnl={:.4}",
-        summary.decisions, summary.signal_intents, summary.trades, summary.average_edge, pnl
+        summary.decisions,
+        summary.signal_intents,
+        summary.trades,
+        summary.average_edge,
+        outcomes.pnl_sum
     );
-    println!("  wins={} losses={}", wins, losses);
+    println!(
+        "  wins={} losses={} open_trades={} unresolved_trades={} aborted_without_pnl={}",
+        outcomes.wins,
+        outcomes.losses,
+        outcomes.open_trades,
+        outcomes.unresolved_trades,
+        outcomes.aborted_without_pnl
+    );
     println!("  regimes:");
     for (regime, count) in db.regime_counts(run_id)? {
         println!("    {regime}: {count}");
@@ -442,5 +453,16 @@ mod tests {
         assert_eq!(report.decisions, 1);
         assert_eq!(report.signal_intents, 1);
         assert_eq!(report.trades, 0);
+        assert_eq!(
+            db.trade_outcome_summary("fixture").unwrap(),
+            crate::observability::db::WinLossSummary {
+                wins: 0,
+                losses: 0,
+                open_trades: 0,
+                unresolved_trades: 0,
+                aborted_without_pnl: 0,
+                pnl_sum: 0.0
+            }
+        );
     }
 }

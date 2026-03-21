@@ -125,8 +125,8 @@ The SQLite layer now keeps experiment-oriented data in a more normalized layout.
 - `recorder_metadata` — balance/time or other recorder-side payloads.
 - `experiment_runs` — run metadata including `run_id`, binary type, model version, strategy version, prior version, config fingerprint, and run timestamp.
 - `decision_events` — one row per decision snapshot with regime, model metadata, probabilities, proposed/executed stake, and rejection reason.
-- `trade_intents` — intended trades derived from decisions, including signal-only versus executed outcomes.
-- `executed_trades` — realized or simulated execution results plus exit reason and PnL.
+- `trade_intents` — one execution-attempt record derived from a decision, including signal-only, rejection, submission, failure, or execution state.
+- `executed_trades` — realized or simulated execution records for trades that actually opened, plus exit reason and PnL.
 
 ### Compatibility views
 
@@ -138,16 +138,20 @@ This design keeps raw ticks and experiment metadata normalized instead of forcin
 
 ## Decision / intent / trade semantics
 
-The project now treats decision generation and execution telemetry as separate layers:
+The project now treats decision generation and execution telemetry as separate layers, with a single lifecycle per logical opportunity:
+
+- one evaluated opportunity should produce one primary `decision_events` row,
+- that decision may produce one `trade_intents` row describing the execution attempt semantics,
+- and only an actual open should create an `executed_trades` row.
 
 - `decision_events.decision`
   - `hold` — no actionable entry was produced or the entry was blocked.
-  - `signal` — the shared decision engine produced an actionable entry intent, but no execution happened yet.
-  - `enter` — an actionable decision was actually entered.
+  - `signal` — the shared decision engine produced an actionable entry intent.
 - `trade_intents.intent_status`
   - `signal_only` — replay or audit-only signal with no execution attempt.
   - `rejected` — an intent existed, but risk / timing / lifecycle checks blocked it.
   - `submitted` — live execution attempted to route the intent through the trader FSM.
+  - `execution_failed` — a live execution attempt was made but no trade opened.
   - `executed` — a trade was actually opened.
 - `executed_trades.status`
   - `open` — trade is currently open.
@@ -155,6 +159,13 @@ The project now treats decision generation and execution telemetry as separate l
   - `closed_early` — live trade was sold before expiry.
   - `aborted` — live execution attempt was interrupted before a clean close.
   - `simulated_settled` — replay execution completed through the simulated lifecycle.
+
+### Lifecycle examples
+
+- **Replay, signal-only:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=signal_only`, and no `executed_trades` row.
+- **Live, execution failed:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=execution_failed`, and no `executed_trades` row because nothing opened.
+- **Live, trade opened successfully:** one `decision_events` row with `decision=signal`, one `trade_intents` row that moves `submitted -> executed`, and one `executed_trades` row that moves `open -> settled|closed_early|aborted`.
+- **Replay with simulated execution:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=executed`, and one `executed_trades` row that finishes as `simulated_settled`.
 
 ### Benchmark semantics
 
@@ -171,10 +182,17 @@ It is no longer allowed to drift between a legacy live-only strategy output and 
 Reports distinguish between:
 
 - **decisions** — rows in `decision_events`,
-- **signal intents** — non-executed but actionable `trade_intents`,
+- **signal intents** — `trade_intents` rows with `intent_status = signal_only`,
 - **trades** — rows in `executed_trades` only.
 
 So a `signal` does **not** count as a trade in reports.
+
+Win/loss reporting is intentionally conservative:
+
+- only rows with realized non-`NULL` `pnl` count toward wins or losses,
+- `open` trades are reported separately,
+- non-open rows with `NULL pnl` are reported as unresolved,
+- `aborted` rows with `NULL pnl` are also broken out explicitly as `aborted_without_pnl`.
 
 ### Replay versus live
 
@@ -198,6 +216,7 @@ So a `signal` does **not** count as a trade in reports.
 
 - schema round-trip tests cover run metadata, decisions, intents, and executions,
 - replay/report tests cover command parsing and report aggregation,
+- lifecycle tests reject impossible combinations such as `signal_only` intents with `executed_trades`,
 - replay fixtures can be created by recording a short `raw_ticks` sequence and replaying it through `research`.
 
 ## Current limitations

@@ -152,12 +152,6 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                             let Some(decision) = engine.step(&tick, false) else { continue; };
                             emit_decision_telemetry(&telemetry_tx, &decision, ledger.realized_pnl);
 
-                            if let Some(ref db) = db {
-                                if let Err(err) = persist_live_decision(db, &run_id, &decision, false) {
-                                    warn!(error = ?err, "Failed to persist decision telemetry");
-                                }
-                            }
-
                             if decision.decision == "signal" {
                                 if trader.is_idle() {
                                     if let Some(contract_type) = parse_contract_direction(decision.contract_direction.as_deref()) {
@@ -179,12 +173,23 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                             Err(e) => {
                                                 error!(error = %e, edge = decision.edge, proposed_stake = decision.proposed_stake, "Trade execution failed");
                                                 if let Some(ref db) = db {
-                                                    let _ = persist_live_decision(db, &run_id, &decision, true);
+                                                    let _ = mark_live_execution_failed(db, &run_id, &decision);
                                                 }
                                                 trader.reset();
                                             }
                                         }
                                     }
+                                } else if let Some(ref db) = db {
+                                    let mut rejected = decision.clone();
+                                    rejected.rejection_reason = Some("position_already_open".into());
+                                    rejected.executed_stake = 0.0;
+                                    if let Err(err) = persist_live_rejected_intent(db, &run_id, &rejected) {
+                                        warn!(error = ?err, "Failed to persist rejected live intent");
+                                    }
+                                }
+                            } else if let Some(ref db) = db {
+                                if let Err(err) = persist_live_decision(db, &run_id, &decision) {
+                                    warn!(error = ?err, "Failed to persist decision telemetry");
                                 }
                             }
 
@@ -257,7 +262,7 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                 if let Some(pending) = pending_execution.take() {
                     let _ = db.update_trade_intent_status(
                         pending.intent_id,
-                        "submitted",
+                        "executed",
                         pending.stake,
                         Some("disconnect_aborted"),
                     );
@@ -304,18 +309,7 @@ fn persist_live_decision(
     db: &TelemetryDb,
     run_id: &str,
     decision: &DecisionContext,
-    mark_execution_failed: bool,
 ) -> rusqlite::Result<i64> {
-    let decision_label = if mark_execution_failed && decision.decision == "signal" {
-        "hold"
-    } else {
-        &decision.decision
-    };
-    let rejection_reason = if mark_execution_failed {
-        Some("execution_failed")
-    } else {
-        decision.rejection_reason.as_deref()
-    };
     let decision_id = db.insert_run_decision(&RunDecisionRecord {
         run_id,
         timestamp_ms: decision.ts_ms,
@@ -327,8 +321,8 @@ fn persist_live_decision(
         model_metadata: &decision.model_metadata,
         contract_direction: decision.contract_direction.as_deref(),
         benchmark_signal: &decision.benchmark_signal,
-        decision: decision_label,
-        rejection_reason,
+        decision: &decision.decision,
+        rejection_reason: decision.rejection_reason.as_deref(),
         edge: decision.edge,
         q_prior: decision.prior,
         q_model: decision.q_model,
@@ -356,10 +350,102 @@ fn persist_live_decision(
             executed_stake: 0.0,
             execution_enabled: true,
             intent_status,
-            rejection_reason,
+            rejection_reason: decision.rejection_reason.as_deref(),
         })?;
     }
     Ok(decision_id)
+}
+
+fn mark_live_execution_failed(
+    db: &TelemetryDb,
+    run_id: &str,
+    decision: &DecisionContext,
+) -> rusqlite::Result<()> {
+    let decision_id = db.insert_run_decision(&RunDecisionRecord {
+        run_id,
+        timestamp_ms: decision.ts_ms,
+        symbol: &decision.symbol,
+        price: decision.price,
+        regime: &decision.regime,
+        prior_mode: &decision.prior_mode,
+        strategy_mode: &decision.strategy_mode,
+        model_metadata: &decision.model_metadata,
+        contract_direction: decision.contract_direction.as_deref(),
+        benchmark_signal: &decision.benchmark_signal,
+        decision: "signal",
+        rejection_reason: Some("execution_failed"),
+        edge: decision.edge,
+        q_prior: decision.prior,
+        q_model: decision.q_model,
+        q_final: decision.q_final,
+        q_low: decision.q_low,
+        q_high: decision.q_high,
+        confidence: decision.confidence,
+        time_left_sec: decision.time_left_sec,
+        proposed_stake: decision.proposed_stake,
+        executed_stake: 0.0,
+        feature_summary: &decision.feature_summary,
+    })?;
+    if let Some(direction) = decision.contract_direction.as_deref() {
+        db.insert_trade_intent(&TradeIntentRecord {
+            run_id,
+            decision_id,
+            timestamp_ms: decision.ts_ms,
+            contract_direction: direction,
+            proposed_stake: decision.proposed_stake,
+            executed_stake: 0.0,
+            execution_enabled: true,
+            intent_status: "execution_failed",
+            rejection_reason: Some("execution_failed"),
+        })?;
+    }
+    Ok(())
+}
+
+fn persist_live_rejected_intent(
+    db: &TelemetryDb,
+    run_id: &str,
+    decision: &DecisionContext,
+) -> rusqlite::Result<()> {
+    let decision_id = db.insert_run_decision(&RunDecisionRecord {
+        run_id,
+        timestamp_ms: decision.ts_ms,
+        symbol: &decision.symbol,
+        price: decision.price,
+        regime: &decision.regime,
+        prior_mode: &decision.prior_mode,
+        strategy_mode: &decision.strategy_mode,
+        model_metadata: &decision.model_metadata,
+        contract_direction: decision.contract_direction.as_deref(),
+        benchmark_signal: &decision.benchmark_signal,
+        decision: "signal",
+        rejection_reason: decision.rejection_reason.as_deref(),
+        edge: decision.edge,
+        q_prior: decision.prior,
+        q_model: decision.q_model,
+        q_final: decision.q_final,
+        q_low: decision.q_low,
+        q_high: decision.q_high,
+        confidence: decision.confidence,
+        time_left_sec: decision.time_left_sec,
+        proposed_stake: decision.proposed_stake,
+        executed_stake: 0.0,
+        feature_summary: &decision.feature_summary,
+    })?;
+    if let Some(direction) = decision.contract_direction.as_deref() {
+        db.insert_trade_intent(&TradeIntentRecord {
+            run_id,
+            decision_id,
+            timestamp_ms: decision.ts_ms,
+            contract_direction: direction,
+            proposed_stake: decision.proposed_stake,
+            executed_stake: 0.0,
+            execution_enabled: true,
+            intent_status: "rejected",
+            rejection_reason: decision.rejection_reason.as_deref(),
+        })?;
+    }
+    Ok(())
 }
 
 fn persist_live_execution_open(
@@ -380,7 +466,7 @@ fn persist_live_execution_open(
         model_metadata: &decision.model_metadata,
         contract_direction: decision.contract_direction.as_deref(),
         benchmark_signal: &decision.benchmark_signal,
-        decision: "enter",
+        decision: "signal",
         rejection_reason: None,
         edge: decision.edge,
         q_prior: decision.prior,
@@ -391,7 +477,7 @@ fn persist_live_execution_open(
         confidence: decision.confidence,
         time_left_sec: decision.time_left_sec,
         proposed_stake: decision.proposed_stake,
-        executed_stake: decision.proposed_stake,
+        executed_stake: 0.0,
         feature_summary: &decision.feature_summary,
     })?;
     let intent_id = db.insert_trade_intent(&TradeIntentRecord {
@@ -400,9 +486,9 @@ fn persist_live_execution_open(
         timestamp_ms: decision.ts_ms,
         contract_direction: decision.contract_direction.as_deref().unwrap_or("UNKNOWN"),
         proposed_stake: decision.proposed_stake,
-        executed_stake: decision.proposed_stake,
+        executed_stake: 0.0,
         execution_enabled: true,
-        intent_status: "executed",
+        intent_status: "submitted",
         rejection_reason: None,
     })?;
     let executed_trade_id = db.insert_executed_trade(&ExecutedTradeRecord {
@@ -470,5 +556,99 @@ fn parse_contract_direction(direction: Option<&str>) -> Option<ContractType> {
         Some("CALL") => Some(ContractType::Call),
         Some("PUT") => Some(ContractType::Put),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::decision_engine::DecisionContext;
+    use crate::observability::db::RunMetadata;
+
+    fn sample_decision() -> DecisionContext {
+        DecisionContext {
+            ts_ms: 10,
+            symbol: "R_100".into(),
+            price: 100.0,
+            regime: "calm".into(),
+            prior: 0.51,
+            q_model: 0.54,
+            q_final: 0.53,
+            q_low: 0.51,
+            q_high: 0.55,
+            confidence: 1.0,
+            edge: 0.03,
+            time_left_sec: 120.0,
+            contract_direction: Some("CALL".into()),
+            benchmark_signal: "CALL".into(),
+            decision: "signal".into(),
+            rejection_reason: None,
+            proposed_stake: 1.2,
+            executed_stake: 0.0,
+            execution_enabled: true,
+            prior_mode: "process-v1".into(),
+            strategy_mode: "process".into(),
+            model_metadata: "quant-only".into(),
+            feature_summary: "{}".into(),
+            simulated_trade_closed: None,
+        }
+    }
+
+    #[test]
+    fn live_execution_failure_persists_single_failed_lifecycle() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "live-fail".into(),
+            binary_type: "executor".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "fp".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+
+        mark_live_execution_failed(&db, "live-fail", &sample_decision()).unwrap();
+
+        assert_eq!(db.count_rows("decision_events", "live-fail").unwrap(), 1);
+        assert_eq!(
+            db.count_trade_intents_by_status("live-fail", "execution_failed")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_rows("executed_trades", "live-fail").unwrap(), 0);
+    }
+
+    #[test]
+    fn rejected_live_signal_persists_without_trade_row() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "live-rejected".into(),
+            binary_type: "executor".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "fp".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+
+        let mut decision = sample_decision();
+        decision.rejection_reason = Some("position_already_open".into());
+        persist_live_rejected_intent(&db, "live-rejected", &decision).unwrap();
+
+        assert_eq!(
+            db.count_rows("decision_events", "live-rejected").unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_trade_intents_by_status("live-rejected", "rejected")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_rows("executed_trades", "live-rejected").unwrap(),
+            0
+        );
     }
 }
