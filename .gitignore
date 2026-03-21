@@ -1,4 +1,4 @@
-# Rust
+﻿# Rust
 target/
 target2/
 **/*.rs.bk
@@ -43,3 +43,25 @@ Thumbs.db
 tmp/
 target/
 node_modules/
+
+node_modules/
+target/
+__pycache__/
+.env
+.env.local
+dist/
+build/
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+venv/
+.venv/
+tmp/
+.temp/
+*.log
+*.zip
+*.pdf
+*.csv
+*.xlsx
+*.db
