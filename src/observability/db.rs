@@ -442,10 +442,31 @@ impl TelemetryDb {
         )
     }
 
+    pub fn count_executed_trades_by_status(&self, run_id: &str, status: &str) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM executed_trades WHERE run_id = ?1 AND status = ?2",
+            params![run_id, status],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn executed_trade_contract_ids(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(contract_id, '') FROM executed_trades WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
     fn validate_trade_intent(&self, record: &TradeIntentRecord<'_>) -> Result<()> {
         if !matches!(
             record.intent_status,
-            "signal_only" | "rejected" | "submitted" | "execution_failed" | "executed"
+            "signal_only"
+                | "rejected"
+                | "submitted"
+                | "execution_failed"
+                | "executed"
+                | "dry_run_executed"
         ) {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "invalid intent_status {}",
@@ -458,7 +479,13 @@ impl TelemetryDb {
     fn validate_executed_trade(&self, record: &ExecutedTradeRecord<'_>) -> Result<()> {
         if !matches!(
             record.status,
-            "open" | "settled" | "closed_early" | "aborted" | "simulated_settled"
+            "open"
+                | "settled"
+                | "closed_early"
+                | "aborted"
+                | "simulated_settled"
+                | "dry_run_open"
+                | "dry_run_settled"
         ) {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "invalid executed trade status {}",

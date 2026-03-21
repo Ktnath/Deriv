@@ -153,12 +153,15 @@ The project now treats decision generation and execution telemetry as separate l
   - `submitted` — live execution attempted to route the intent through the trader FSM.
   - `execution_failed` — a live execution attempt was made but no trade opened.
   - `executed` — a trade was actually opened.
+  - `dry_run_executed` — executor-owned dry-run opened a synthetic simulated trade lifecycle without routing to Deriv.
 - `executed_trades.status`
   - `open` — trade is currently open.
   - `settled` — live trade settled naturally.
   - `closed_early` — live trade was sold before expiry.
   - `aborted` — live execution attempt was interrupted before a clean close.
   - `simulated_settled` — replay execution completed through the simulated lifecycle.
+  - `dry_run_open` — executor-owned dry-run opened a simulated trade row.
+  - `dry_run_settled` — executor-owned dry-run closed that simulated trade row.
 
 ### Lifecycle examples
 
@@ -166,6 +169,7 @@ The project now treats decision generation and execution telemetry as separate l
 - **Live, execution failed:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=execution_failed`, and no `executed_trades` row because nothing opened.
 - **Live, trade opened successfully:** one `decision_events` row with `decision=signal`, one `trade_intents` row that moves `submitted -> executed`, and one `executed_trades` row that moves `open -> settled|closed_early|aborted`.
 - **Replay with simulated execution:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=executed`, and one `executed_trades` row that finishes as `simulated_settled`.
+- **Executor dry-run:** one `decision_events` row with `decision=signal`, one `trade_intents` row with `intent_status=dry_run_executed`, and one `executed_trades` row that moves `dry_run_open -> dry_run_settled` using a synthetic `contract_id` prefixed with `dry_run:`.
 
 ### Benchmark semantics
 
@@ -194,17 +198,27 @@ Win/loss reporting is intentionally conservative:
 - non-open rows with `NULL pnl` are reported as unresolved,
 - `aborted` rows with `NULL pnl` are also broken out explicitly as `aborted_without_pnl`.
 
-### Replay versus live
+### Replay versus live versus dry-run
 
 - Replay uses the shared `DecisionEngine` in **replay-owned lifecycle mode**. In execution-enabled replay, the engine itself opens simulated trades, closes them at contract expiry, updates its internal `RiskGate`, and records `simulated_settled` outcomes.
 - Live execution uses the same decision generation path in **live-synchronized mode**. In this mode the executor and trader FSM remain the source of truth for order lifecycle, while the engine only keeps a synchronized risk view.
+- `DRY_RUN=1` now also uses **live-synchronized mode**, but the executor owns the simulation lifecycle instead of Deriv. The trader still opens a realistic in-memory contract shape, the executor persists an `executed_trades` row with `dry_run_open`, then immediately settles it as `dry_run_settled` with `exit_reason=dry_run_simulated_expiry`.
 - The executor now calls explicit synchronization hooks on the engine:
   - `notify_live_balance(balance)` whenever Deriv sends an updated account balance,
   - `notify_live_trade_opened(...)` after the trader FSM has a real open contract,
   - `notify_live_trade_closed(...)` after settlement or early close with realized PnL,
   - `notify_live_trade_aborted(...)` when a disconnect or interrupted execution invalidates the open trade.
+- The same open/close synchronization hooks are also used for executor dry-run, so Kelly sizing and open-position gating stay coherent across consecutive dry-run trades.
 - This prevents live drift: Kelly sizing reads the latest synchronized live balance, open-position gating matches the trader FSM, and realized PnL is only applied once when the live trade truly closes.
 - On reconnect, the executor clears aborted live state through the same synchronization path so the engine does not keep a phantom open position.
+
+### How to audit `DRY_RUN=1`
+
+- Expect one `decision_events` row per actionable dry-run opportunity.
+- Expect one `trade_intents` row with `intent_status = dry_run_executed`.
+- Expect one `executed_trades` row whose lifecycle ends at `status = dry_run_settled`.
+- Dry-run rows are distinct from replay rows because replay uses `status = simulated_settled`.
+- Dry-run rows are distinct from real executor rows because they use `dry_run_*` statuses and synthetic `contract_id` values prefixed with `dry_run:`.
 
 ## Offline reports
 

@@ -101,12 +101,15 @@ impl Trader {
 
         if self.dry_run {
             info!(
-                "[DRY_RUN] Would send proposal for {} {} stake={:.2}",
+                "[DRY_RUN] Simulating proposal/buy lifecycle for {} {} stake={:.2}",
                 symbol.0, ct_str, stake
             );
-            // Simulate immediate settlement in dry run
             if let Some(trade) = self.active_trade.as_mut() {
-                trade.state = TradeState::Settled;
+                trade.state = TradeState::Open;
+                trade.proposal_id = Some(format!("dry_run_proposal_{}", trade.created_at.0));
+                trade.contract_id = Some(format!("dry_run:{}", trade.created_at.0));
+                trade.buy_price = Some(stake);
+                trade.payout = Some(stake);
             }
             return Ok(());
         }
@@ -405,5 +408,28 @@ mod tests {
         // is_expired = true → Settled
         let action = trader.handle_poc_update("c_123", false, true, false, -0.80, 1.0);
         assert!(matches!(action, PocAction::Settled(_)));
+    }
+
+    #[tokio::test]
+    async fn dry_run_enter_trade_exposes_open_lifecycle_state() {
+        let router = Arc::new(Router::new(tokio::sync::mpsc::channel(1).0));
+        let mut trader = Trader::new(router, true, 0.50);
+
+        trader
+            .enter_trade(&SymbolId("R_100".into()), ContractType::Call, 1.0, 300, "s")
+            .await
+            .unwrap();
+
+        let trade = trader
+            .active_trade
+            .as_ref()
+            .expect("dry-run trade should exist");
+        assert_eq!(trade.state, TradeState::Open);
+        assert_eq!(trade.buy_price, Some(1.0));
+        assert_eq!(trade.payout, Some(1.0));
+        assert!(trade
+            .contract_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("dry_run:")));
     }
 }
