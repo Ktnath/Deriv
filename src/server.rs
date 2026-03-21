@@ -15,7 +15,7 @@ pub struct AppState {
     pub tx: broadcast::Sender<String>,
 }
 
-pub async fn start_server(tx: broadcast::Sender<String>) {
+pub async fn start_server(tx: broadcast::Sender<String>, bind_addr: String) {
     let state = Arc::new(AppState { tx });
 
     let cors = CorsLayer::new()
@@ -28,12 +28,11 @@ pub async fn start_server(tx: broadcast::Sender<String>) {
         .layer(cors)
         .with_state(state);
 
-    let addr = "127.0.0.1:3000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    info!("Starting telemetry server on ws://{}", addr);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+    info!(bind_addr = %bind_addr, "Starting telemetry server");
 
     if let Err(e) = axum::serve(listener, app).await {
-        error!("Server error: {}", e);
+        error!(error = %e, "Server error");
     }
 }
 
@@ -47,10 +46,9 @@ async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx.subscribe();
 
-    // Send a welcome message
     let welcome = serde_json::json!({ "type": "backend_status", "status": "connected" });
     if socket
-        .send(Message::Text(welcome.to_string()))
+        .send(Message::Text(welcome.to_string().into()))
         .await
         .is_err()
     {
@@ -58,7 +56,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     while let Ok(msg) = rx.recv().await {
-        if socket.send(Message::Text(msg)).await.is_err() {
+        if socket.send(Message::Text(msg.into())).await.is_err() {
             break;
         }
     }

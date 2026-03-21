@@ -3,9 +3,23 @@ name = "deriv-bot"
 version = "0.2.0"
 edition = "2021"
 
+default-run = "executor"
+
 [[bin]]
 name = "deriv-bot"
 path = "src/main.rs"
+
+[[bin]]
+name = "executor"
+path = "src/bin/executor.rs"
+
+[[bin]]
+name = "recorder"
+path = "src/bin/recorder.rs"
+
+[[bin]]
+name = "research"
+path = "src/bin/research.rs"
 
 [dependencies]
 # Async runtime

@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    deriv_bot::app::executor::run_executor().await
+    deriv_bot::app::recorder::run_recorder().await
 }
