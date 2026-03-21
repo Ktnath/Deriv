@@ -14,12 +14,16 @@ pub struct BotConfig {
     pub contract_duration: u64,
     pub duration_unit: String,
     pub stake: f64,
+    pub min_stake: f64,
+    pub model_path: Option<String>,
+    pub allow_model_fallback: bool,
+    pub market_prior: Option<f64>,
     // Risk limits
     pub max_open_positions: usize,
     pub max_daily_loss: f64,
     pub cooldown_after_loss_ms: u64,
     pub max_consecutive_losses: usize,
-    // Stop-loss only
+    // Early-exit loss threshold for open contracts
     pub stop_loss_pct: f64,
 }
 
@@ -51,6 +55,27 @@ impl BotConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0),
+            min_stake: env::var("DERIV_MIN_STAKE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.35),
+            model_path: env::var("DERIV_MODEL_PATH")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            allow_model_fallback: env::var("DERIV_ALLOW_MODEL_FALLBACK")
+                .ok()
+                .map(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(true),
+            market_prior: env::var("DERIV_MARKET_PRIOR")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|p| p.clamp(0.0, 1.0)),
             max_open_positions: env::var("DERIV_MAX_POSITIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())

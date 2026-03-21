@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 pub enum PocAction {
     /// Contract naturally settled (is_sold or is_expired).
     Settled(f64),
-    /// Profit/loss threshold hit — sell immediately.
+    /// Early-exit loss threshold hit on an open contract — sell immediately.
     SellNow {
         contract_id: String,
         profit: f64,
@@ -217,7 +217,7 @@ impl Trader {
                     return PocAction::Settled(profit);
                 }
 
-                // Check stop-loss threshold
+                // Check early-exit loss threshold for the live contract
                 if buy_price > 0.0 && is_valid_to_sell {
                     let profit_pct = profit / buy_price;
 
@@ -228,7 +228,7 @@ impl Trader {
                             buy_price,
                             profit_pct = format!("{:.1}%", profit_pct * 100.0),
                             threshold = format!("-{:.1}%", self.stop_loss_pct * 100.0),
-                            "🛑 Stop-loss triggered — selling contract"
+                            "🛑 Early-exit loss threshold triggered — selling contract"
                         );
                         return PocAction::SellNow {
                             contract_id: contract_id.to_string(),
@@ -251,7 +251,7 @@ impl Trader {
         PocAction::Hold
     }
 
-    /// Sell a contract early (take-profit / stop-loss).
+    /// Sell a contract early after an early-exit decision.
     pub async fn sell_contract(&mut self, contract_id: &str, price: f64) -> Result<f64, BotError> {
         info!(contract_id, price, "Sending sell RPC");
         let payload = requests::sell(contract_id, price);
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poc_action_stop_loss() {
+    fn test_poc_action_early_exit_loss_threshold() {
         let router = Arc::new(Router::new(tokio::sync::mpsc::channel(1).0));
         let mut trader = Trader::new(router, false, 0.50);
         trader.active_trade = Some(ActiveTrade {

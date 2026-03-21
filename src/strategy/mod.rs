@@ -409,52 +409,8 @@ impl StrategyEngine {
             );
         }
 
-        // --- Phase 7 IL Dataset Exporter ---
-        let p7_ema_now = ema_slice(&fast_closes, 10);
-        let p7_ema_prev = ema_slice(&fast_closes[..fast_closes.len().saturating_sub(5)], 10);
-        let p7_fast_slope = p7_ema_now - p7_ema_prev;
-        let p7_rsi = rsi_from_closes(&fast_closes, 14).unwrap_or(50.0);
-        let p7_bb = bb_position(&self.prices, 100, 2.5).unwrap_or(0.0);
-
-        use std::io::Write;
-        let p7_path = "dataset_v7.csv";
-        let p7_exists = std::path::Path::new(p7_path).exists();
-        if let Ok(mut p7_file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p7_path)
-        {
-            if !p7_exists {
-                let _ = writeln!(p7_file, "timestamp_ms,price,slow_slope,fast_slope,rsi_14,bb_pos,atr_pct,alpha_edge,regime_expert,action_expert");
-            }
-            let p7_reg = match regime {
-                Regime::Bullish => 1,
-                Regime::Bearish => -1,
-                Regime::Neutral => 0,
-            };
-            let p7_price = self.prices.last().copied().unwrap_or(0.0);
-            let p7_ts = crate::types::UnixMs::now().0;
-            let p7_sig = match final_sig {
-                Signal::Enter(ContractType::Call) => 1,
-                Signal::Enter(ContractType::Put) => -1,
-                _ => 0,
-            };
-
-            let _ = writeln!(
-                p7_file,
-                "{},{},{:.5},{:.5},{:.2},{:.2},{:.5},{:.5},{},{}",
-                p7_ts,
-                p7_price,
-                slow_slope,
-                p7_fast_slope,
-                p7_rsi,
-                p7_bb,
-                atr_pct_val,
-                edge,
-                p7_reg,
-                p7_sig
-            );
-        }
+        // Live strategy evaluation is side-effect free.
+        // Dataset recording, if reintroduced later, should live behind an explicit offline recorder interface.
 
         if final_sig != Signal::Hold {
             tracing::info!(regime = ?regime, setup = setup_name, final_sig = ?final_sig, "Regime Adaptive Setup Triggered");
@@ -532,5 +488,39 @@ impl StrategyEngine {
         } else {
             "LATE"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AlphaOutput, Prob, RiskDecision, StrategyType, Usd};
+
+    #[test]
+    fn test_generate_signal_does_not_write_dataset_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let mut engine = StrategyEngine::new(StrategyType::Temporal);
+        for i in 0..120 {
+            engine.on_tick(100.0 + (i as f64 * 0.01));
+        }
+        let alpha = AlphaOutput {
+            q_model: Prob(0.62),
+            q_mkt: Prob(0.62),
+            q_final: Prob(0.62),
+            q_low: Prob(0.60),
+            q_high: Prob(0.64),
+            confidence: 0.55,
+        };
+        let risk = RiskDecision {
+            fraction: 0.01,
+            max_size: Usd(1.0),
+        };
+        let _ = engine.generate_signal(&alpha, &risk, 120.0);
+
+        assert!(!dir.path().join("dataset_v7.csv").exists());
+        std::env::set_current_dir(old).unwrap();
     }
 }
