@@ -87,6 +87,7 @@ pub struct ExecutedTradeRecord<'a> {
 #[derive(Debug, Clone)]
 pub struct ReplayReport {
     pub decisions: i64,
+    pub signal_intents: i64,
     pub trades: i64,
     pub average_edge: f64,
     pub pnl_sum: f64,
@@ -324,11 +325,53 @@ impl TelemetryDb {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn update_trade_intent_status(
+        &self,
+        intent_id: i64,
+        intent_status: &str,
+        executed_stake: f64,
+        rejection_reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE trade_intents SET intent_status = ?2, executed_stake = ?3, rejection_reason = ?4 WHERE id = ?1",
+            params![intent_id, intent_status, executed_stake, rejection_reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_executed_trade_lifecycle(
+        &self,
+        trade_id: i64,
+        timestamp_ms: i64,
+        payout: Option<f64>,
+        pnl: Option<f64>,
+        exit_reason: Option<&str>,
+        status: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE executed_trades SET timestamp_ms = ?2, payout = ?3, pnl = ?4, exit_reason = ?5, status = ?6 WHERE id = ?1",
+            params![trade_id, timestamp_ms, payout, pnl, exit_reason, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_latest_executed_trade_for_entry(
+        &self,
+        run_id: &str,
+        entered_at_ms: i64,
+    ) -> Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT et.id FROM executed_trades et JOIN trade_intents ti ON ti.id = et.trade_intent_id WHERE et.run_id = ?1 AND ti.timestamp_ms = ?2 ORDER BY et.id DESC LIMIT 1",
+            params![run_id, entered_at_ms],
+            |row| row.get(0),
+        ).optional()
+    }
+
     pub fn latest_run_report(&self, run_id: &str) -> Result<ReplayReport> {
         self.conn.query_row(
-            "SELECT COUNT(*), SUM(CASE WHEN decision IN ('enter','signal') THEN 1 ELSE 0 END), COALESCE(AVG(edge),0), COALESCE((SELECT SUM(COALESCE(pnl,0)) FROM executed_trades WHERE run_id = ?1),0) FROM decision_events WHERE run_id = ?1",
+            "SELECT COUNT(*), COALESCE((SELECT COUNT(*) FROM trade_intents WHERE run_id = ?1 AND intent_status = 'signal_only'),0), COALESCE((SELECT COUNT(*) FROM executed_trades WHERE run_id = ?1),0), COALESCE(AVG(edge),0), COALESCE((SELECT SUM(COALESCE(pnl,0)) FROM executed_trades WHERE run_id = ?1),0) FROM decision_events WHERE run_id = ?1",
             [run_id],
-            |row| Ok(ReplayReport { decisions: row.get(0)?, trades: row.get(1)?, average_edge: row.get(2)?, pnl_sum: row.get(3)? }),
+            |row| Ok(ReplayReport { decisions: row.get(0)?, signal_intents: row.get(1)?, trades: row.get(2)?, average_edge: row.get(3)?, pnl_sum: row.get(4)? }),
         )
     }
 
@@ -456,6 +499,7 @@ mod tests {
         .unwrap();
         let report = db.latest_run_report("r1").unwrap();
         assert_eq!(report.decisions, 1);
+        assert_eq!(report.signal_intents, 1);
         assert_eq!(report.trades, 1);
         assert!(report.pnl_sum > 1.0);
     }

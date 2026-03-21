@@ -1,5 +1,7 @@
 use crate::{
-    app::decision_engine::{DecisionContext, DecisionEngine, DecisionEngineConfig},
+    app::decision_engine::{
+        DecisionContext, DecisionEngine, DecisionEngineConfig, SimulatedTradeSettlement,
+    },
     config::ResearchConfig,
     observability::db::{
         ExecutedTradeRecord, RunDecisionRecord, RunMetadata, TelemetryDb, TradeIntentRecord,
@@ -216,30 +218,54 @@ fn persist_decision_bundle(
             rejection_reason: decision.rejection_reason.as_deref(),
         })?;
         if decision.executed_stake > 0.0 {
-            let pnl = simulated_pnl(direction, decision.edge, decision.executed_stake);
-            db.insert_executed_trade(&ExecutedTradeRecord {
+            let trade_id = db.insert_executed_trade(&ExecutedTradeRecord {
                 run_id,
                 trade_intent_id: intent_id,
                 timestamp_ms: decision.ts_ms,
                 contract_id: None,
                 contract_direction: direction,
                 stake: decision.executed_stake,
-                payout: Some(decision.executed_stake + pnl),
-                pnl: Some(pnl),
-                exit_reason: Some(if pnl >= 0.0 {
-                    "replay_positive_edge"
-                } else {
-                    "replay_negative_edge"
-                }),
-                status: "simulated_settled",
+                payout: None,
+                pnl: None,
+                exit_reason: None,
+                status: "open",
             })?;
+            if let Some(settlement) = decision.simulated_trade_closed.as_ref() {
+                db.update_executed_trade_lifecycle(
+                    trade_id,
+                    settlement.settled_at_ms,
+                    Some(settlement.payout),
+                    Some(settlement.pnl),
+                    Some(settlement.exit_reason.as_str()),
+                    &settlement.status,
+                )?;
+            }
         }
+    }
+    if let Some(settlement) = decision.simulated_trade_closed.as_ref() {
+        persist_simulated_settlement(db, run_id, settlement)?;
     }
     Ok(())
 }
 
-fn simulated_pnl(_direction: &str, edge: f64, stake: f64) -> f64 {
-    (edge * 2.0 * stake).clamp(-stake, stake)
+fn persist_simulated_settlement(
+    db: &TelemetryDb,
+    run_id: &str,
+    settlement: &SimulatedTradeSettlement,
+) -> anyhow::Result<()> {
+    if let Some(trade_id) =
+        db.find_latest_executed_trade_for_entry(run_id, settlement.entered_at_ms)?
+    {
+        db.update_executed_trade_lifecycle(
+            trade_id,
+            settlement.settled_at_ms,
+            Some(settlement.payout),
+            Some(settlement.pnl),
+            Some(settlement.exit_reason.as_str()),
+            &settlement.status,
+        )?;
+    }
+    Ok(())
 }
 
 fn report(db: &TelemetryDb, run_id: Option<&str>) -> anyhow::Result<()> {
@@ -261,8 +287,8 @@ fn print_report(db: &TelemetryDb, run_id: &str) -> anyhow::Result<()> {
     let (wins, losses, pnl) = db.win_loss_summary(run_id)?;
     println!("report run_id={run_id}");
     println!(
-        "  decisions={} trades={} avg_edge={:.5} pnl={:.4}",
-        summary.decisions, summary.trades, summary.average_edge, pnl
+        "  decisions={} signal_intents={} trades={} avg_edge={:.5} pnl={:.4}",
+        summary.decisions, summary.signal_intents, summary.trades, summary.average_edge, pnl
     );
     println!("  wins={} losses={}", wins, losses);
     println!("  regimes:");
@@ -414,6 +440,7 @@ mod tests {
         .unwrap();
         let report = db.latest_run_report("fixture").unwrap();
         assert_eq!(report.decisions, 1);
-        assert_eq!(report.trades, 1);
+        assert_eq!(report.signal_intents, 1);
+        assert_eq!(report.trades, 0);
     }
 }

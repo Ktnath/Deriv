@@ -6,10 +6,18 @@ use crate::{
         limits::RiskGate,
         settlement::Settlement,
     },
-    types::{ContractType, Price, Prob, RiskDecision, TickUpdate, UnixMs},
+    types::{ContractType, Price, TickUpdate, UnixMs},
 };
 
 pub const MIN_PROCESS_POINTS: usize = 48;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedTrade {
+    pub entered_at_ms: i64,
+    pub settle_at_ms: i64,
+    pub direction: String,
+    pub stake: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct DecisionContext {
@@ -36,6 +44,19 @@ pub struct DecisionContext {
     pub strategy_mode: String,
     pub model_metadata: String,
     pub feature_summary: String,
+    pub simulated_trade_closed: Option<SimulatedTradeSettlement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatedTradeSettlement {
+    pub entered_at_ms: i64,
+    pub settled_at_ms: i64,
+    pub direction: String,
+    pub stake: f64,
+    pub pnl: f64,
+    pub payout: f64,
+    pub exit_reason: String,
+    pub status: String,
 }
 
 pub struct DecisionEngine {
@@ -54,6 +75,7 @@ pub struct DecisionEngine {
     risk_gate: RiskGate,
     last_trade_time: i64,
     contract_start: Option<i64>,
+    open_simulated_trade: Option<SimulatedTrade>,
 }
 
 pub struct DecisionEngineConfig {
@@ -104,11 +126,13 @@ impl DecisionEngine {
             ),
             last_trade_time: 0,
             contract_start: None,
+            open_simulated_trade: None,
         })
     }
 
     pub fn step(&mut self, tick: &TickUpdate, execution_enabled: bool) -> Option<DecisionContext> {
         let now = UnixMs(tick.epoch * 1000);
+        let simulated_trade_closed = self.maybe_settle_simulated_trade(tick, now);
         self.settlement.handle_tick(tick);
         self.feature_extractor.push_price(tick.price);
         self.alpha.update_spot_return(tick.price, now);
@@ -155,10 +179,7 @@ impl DecisionEngine {
             confidence_multiplier,
             time_left,
         );
-        let benchmark_signal = live_input
-            .contract
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "HOLD".to_string());
+        let benchmark_signal = benchmark_signal(live_input.contract);
         let mut decision = "hold".to_string();
         let mut rejection_reason = live_input.rejection_reason.clone();
         let proposed_stake = risk_dec.max_size.0;
@@ -167,6 +188,8 @@ impl DecisionEngine {
             let can = self.risk_gate.can_trade(now);
             if let Err(rej) = can {
                 rejection_reason = Some(rej.to_string());
+            } else if self.open_simulated_trade.is_some() {
+                rejection_reason = Some("simulated_trade_open".to_string());
             } else if (now.0 - self.last_trade_time) <= self.contract_duration as i64 * 1000 {
                 rejection_reason = Some("trade_cooldown_active".to_string());
             } else if proposed_stake < self.min_stake {
@@ -177,13 +200,18 @@ impl DecisionEngine {
                     executed_stake = proposed_stake;
                     self.last_trade_time = now.0;
                     self.risk_gate.on_trade_opened();
+                    self.open_simulated_trade = Some(SimulatedTrade {
+                        entered_at_ms: now.0,
+                        settle_at_ms: now.0 + self.contract_duration as i64 * 1000,
+                        direction: contract.to_string(),
+                        stake: proposed_stake,
+                    });
                 }
-                let _ = contract;
             }
         }
         Some(DecisionContext {
             ts_ms: now.0,
-            symbol: tick.symbol.clone(),
+            symbol: self.symbol.clone(),
             price: tick.price,
             regime: process_snapshot.regime.as_str().to_string(),
             prior: process_snapshot.prior.0,
@@ -205,8 +233,57 @@ impl DecisionEngine {
             strategy_mode: self.strategy_mode.clone(),
             model_metadata: self.model_metadata.clone(),
             feature_summary: feature_summary(&live_input, &alpha_out),
+            simulated_trade_closed,
         })
     }
+
+    fn maybe_settle_simulated_trade(
+        &mut self,
+        tick: &TickUpdate,
+        now: UnixMs,
+    ) -> Option<SimulatedTradeSettlement> {
+        let trade = self.open_simulated_trade.clone()?;
+        if now.0 < trade.settle_at_ms {
+            return None;
+        }
+        let pnl = simulated_pnl(
+            &trade.direction,
+            self.settlement.current_price,
+            tick.price,
+            trade.stake,
+        );
+        self.risk_gate.on_trade_closed(pnl, now);
+        self.open_simulated_trade = None;
+        Some(SimulatedTradeSettlement {
+            entered_at_ms: trade.entered_at_ms,
+            settled_at_ms: now.0,
+            direction: trade.direction,
+            stake: trade.stake,
+            payout: trade.stake + pnl,
+            pnl,
+            exit_reason: "replay_contract_expiry".to_string(),
+            status: "simulated_settled".to_string(),
+        })
+    }
+}
+
+fn simulated_pnl(direction: &str, entry_price: f64, settle_price: f64, stake: f64) -> f64 {
+    let won = match direction {
+        "CALL" => settle_price >= entry_price,
+        "PUT" => settle_price <= entry_price,
+        _ => false,
+    };
+    if won {
+        stake * 0.95
+    } else {
+        -stake
+    }
+}
+
+fn benchmark_signal(contract: Option<ContractType>) -> String {
+    contract
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "HOLD".to_string())
 }
 
 fn feature_summary(input: &LiveDecisionInput, alpha_out: &AlphaOutput) -> String {
@@ -225,6 +302,7 @@ fn feature_summary(input: &LiveDecisionInput, alpha_out: &AlphaOutput) -> String
         "time_since_large_move": input.features.time_since_large_move,
         "move_zscore": input.features.move_zscore,
         "transition_instability": input.features.transition_instability,
+        "benchmark_signal": benchmark_signal(input.contract),
         "q_low": alpha_out.q_low.0,
         "q_high": alpha_out.q_high.0,
     })
@@ -234,9 +312,9 @@ fn feature_summary(input: &LiveDecisionInput, alpha_out: &AlphaOutput) -> String
 pub fn build_decision(
     regime: &Regime,
     features: &crate::process::ProcessFeatures,
-    prior: Prob,
-    model_probability: Prob,
-    final_probability: Prob,
+    prior: crate::types::Prob,
+    model_probability: crate::types::Prob,
+    final_probability: crate::types::Prob,
     confidence_multiplier: f64,
     time_left_sec: f64,
 ) -> LiveDecisionInput {
@@ -277,5 +355,64 @@ pub fn build_decision(
         contract,
         rejection_reason,
         features: features.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tick(price: f64, epoch: i64) -> TickUpdate {
+        TickUpdate {
+            symbol: "R_100".into(),
+            price,
+            epoch,
+        }
+    }
+
+    #[test]
+    fn replay_execution_closes_positions_and_allows_multiple_trades() {
+        let mut engine = DecisionEngine::new(DecisionEngineConfig {
+            symbol: "R_100".into(),
+            contract_duration: 5,
+            min_stake: 0.35,
+            initial_balance: 100.0,
+            max_open_positions: 1,
+            max_daily_loss: 100.0,
+            cooldown_after_loss_ms: 0,
+            max_consecutive_losses: 10,
+            model_path: None,
+            allow_model_fallback: true,
+            strategy_mode: "process".into(),
+            prior_mode: "process-v1".into(),
+        })
+        .unwrap();
+
+        let mut enters = 0;
+        let mut settlements = 0;
+        for idx in 0..90 {
+            let price = 100.0 + idx as f64 * 0.02;
+            if let Some(ctx) = engine.step(&make_tick(price, idx as i64), true) {
+                if ctx.decision == "enter" {
+                    enters += 1;
+                }
+                if ctx.simulated_trade_closed.is_some() {
+                    settlements += 1;
+                }
+            }
+        }
+
+        assert!(enters >= 2, "expected multiple entries, got {enters}");
+        assert!(
+            settlements >= 1,
+            "expected at least one simulated settlement"
+        );
+    }
+
+    #[test]
+    fn benchmark_signal_matches_contract_semantics() {
+        assert_eq!(benchmark_signal(Some(ContractType::Call)), "CALL");
+        assert_eq!(benchmark_signal(Some(ContractType::Put)), "PUT");
+        assert_eq!(benchmark_signal(None), "HOLD");
     }
 }
