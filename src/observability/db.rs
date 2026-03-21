@@ -93,6 +93,16 @@ pub struct ReplayReport {
     pub pnl_sum: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WinLossSummary {
+    pub wins: i64,
+    pub losses: i64,
+    pub open_trades: i64,
+    pub unresolved_trades: i64,
+    pub aborted_without_pnl: i64,
+    pub pnl_sum: f64,
+}
+
 pub struct TelemetryDb {
     conn: Connection,
 }
@@ -310,6 +320,7 @@ impl TelemetryDb {
     }
 
     pub fn insert_trade_intent(&self, record: &TradeIntentRecord<'_>) -> Result<i64> {
+        self.validate_trade_intent(record)?;
         self.conn.execute(
             "INSERT INTO trade_intents (run_id, decision_id, timestamp_ms, contract_direction, proposed_stake, executed_stake, execution_enabled, intent_status, rejection_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![record.run_id, record.decision_id, record.timestamp_ms, record.contract_direction, record.proposed_stake, record.executed_stake, i64::from(record.execution_enabled), record.intent_status, record.rejection_reason],
@@ -318,6 +329,7 @@ impl TelemetryDb {
     }
 
     pub fn insert_executed_trade(&self, record: &ExecutedTradeRecord<'_>) -> Result<i64> {
+        self.validate_executed_trade(record)?;
         self.conn.execute(
             "INSERT INTO executed_trades (run_id, trade_intent_id, timestamp_ms, contract_id, contract_direction, stake, payout, pnl, exit_reason, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![record.run_id, record.trade_intent_id, record.timestamp_ms, record.contract_id, record.contract_direction, record.stake, record.payout, record.pnl, record.exit_reason, record.status],
@@ -388,11 +400,82 @@ impl TelemetryDb {
     }
 
     pub fn win_loss_summary(&self, run_id: &str) -> Result<(i64, i64, f64)> {
+        let summary = self.trade_outcome_summary(run_id)?;
+        Ok((summary.wins, summary.losses, summary.pnl_sum))
+    }
+
+    pub fn trade_outcome_summary(&self, run_id: &str) -> Result<WinLossSummary> {
         self.conn.query_row(
-            "SELECT SUM(CASE WHEN COALESCE(pnl,0) > 0 THEN 1 ELSE 0 END), SUM(CASE WHEN COALESCE(pnl,0) <= 0 THEN 1 ELSE 0 END), COALESCE(SUM(COALESCE(pnl,0)),0) FROM executed_trades WHERE run_id = ?1",
+            "SELECT
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pnl IS NULL AND status <> 'open' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'aborted' AND pnl IS NULL THEN 1 ELSE 0 END),
+                COALESCE(SUM(COALESCE(pnl,0)),0)
+             FROM executed_trades
+             WHERE run_id = ?1",
             [run_id],
-            |row| Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), row.get::<_, Option<i64>>(1)?.unwrap_or(0), row.get(2)?)),
+            |row| {
+                Ok(WinLossSummary {
+                    wins: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    losses: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    open_trades: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    unresolved_trades: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    aborted_without_pnl: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    pnl_sum: row.get(5)?,
+                })
+            },
         )
+    }
+
+    pub fn count_rows(&self, table: &str, run_id: &str) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1");
+        self.conn.query_row(&sql, [run_id], |row| row.get(0))
+    }
+
+    pub fn count_trade_intents_by_status(&self, run_id: &str, status: &str) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM trade_intents WHERE run_id = ?1 AND intent_status = ?2",
+            params![run_id, status],
+            |row| row.get(0),
+        )
+    }
+
+    fn validate_trade_intent(&self, record: &TradeIntentRecord<'_>) -> Result<()> {
+        if !matches!(
+            record.intent_status,
+            "signal_only" | "rejected" | "submitted" | "execution_failed" | "executed"
+        ) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid intent_status {}",
+                record.intent_status
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_executed_trade(&self, record: &ExecutedTradeRecord<'_>) -> Result<()> {
+        if !matches!(
+            record.status,
+            "open" | "settled" | "closed_early" | "aborted" | "simulated_settled"
+        ) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid executed trade status {}",
+                record.status
+            )));
+        }
+        let intent_status: String = self.conn.query_row(
+            "SELECT intent_status FROM trade_intents WHERE id = ?1",
+            [record.trade_intent_id],
+            |row| row.get(0),
+        )?;
+        if intent_status == "signal_only" {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "signal_only intents cannot create executed trades".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn latest_run_id_for_binary(&self, binary_type: &str) -> Result<Option<String>> {
@@ -484,6 +567,75 @@ mod tests {
                 rejection_reason: None,
             })
             .unwrap();
+        assert!(db
+            .insert_executed_trade(&ExecutedTradeRecord {
+                run_id: "r1",
+                trade_intent_id: intent_id,
+                timestamp_ms: 20,
+                contract_id: Some("c1"),
+                contract_direction: "CALL",
+                stake: 1.2,
+                payout: Some(2.34),
+                pnl: Some(1.14),
+                exit_reason: Some("fixture_win"),
+                status: "settled",
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn submitted_intent_can_create_executed_trade_and_reports_it() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "r1",
+            binary_type: "research".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "abc".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+        let decision_id = db
+            .insert_run_decision(&RunDecisionRecord {
+                run_id: "r1",
+                timestamp_ms: 10,
+                symbol: "R_100",
+                price: 100.0,
+                regime: "calm",
+                prior_mode: "process-v1",
+                strategy_mode: "process",
+                model_metadata: "quant-only",
+                contract_direction: Some("CALL"),
+                benchmark_signal: "CALL",
+                decision: "signal",
+                rejection_reason: None,
+                edge: 0.03,
+                q_prior: 0.51,
+                q_model: 0.54,
+                q_final: 0.53,
+                q_low: 0.51,
+                q_high: 0.55,
+                confidence: 1.0,
+                time_left_sec: 120.0,
+                proposed_stake: 1.2,
+                executed_stake: 1.2,
+                feature_summary: "{}",
+            })
+            .unwrap();
+        let intent_id = db
+            .insert_trade_intent(&TradeIntentRecord {
+                run_id: "r1",
+                decision_id,
+                timestamp_ms: 10,
+                contract_direction: "CALL",
+                proposed_stake: 1.2,
+                executed_stake: 1.2,
+                execution_enabled: true,
+                intent_status: "submitted",
+                rejection_reason: None,
+            })
+            .unwrap();
         db.insert_executed_trade(&ExecutedTradeRecord {
             run_id: "r1",
             trade_intent_id: intent_id,
@@ -499,8 +651,88 @@ mod tests {
         .unwrap();
         let report = db.latest_run_report("r1").unwrap();
         assert_eq!(report.decisions, 1);
-        assert_eq!(report.signal_intents, 1);
+        assert_eq!(report.signal_intents, 0);
         assert_eq!(report.trades, 1);
         assert!(report.pnl_sum > 1.0);
+    }
+
+    #[test]
+    fn null_pnl_is_not_counted_as_loss() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "r2".into(),
+            binary_type: "executor".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "abc".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+        let decision_id = db
+            .insert_run_decision(&RunDecisionRecord {
+                run_id: "r2",
+                timestamp_ms: 10,
+                symbol: "R_100",
+                price: 100.0,
+                regime: "calm",
+                prior_mode: "process-v1",
+                strategy_mode: "process",
+                model_metadata: "quant-only",
+                contract_direction: Some("CALL"),
+                benchmark_signal: "CALL",
+                decision: "enter",
+                rejection_reason: None,
+                edge: 0.03,
+                q_prior: 0.51,
+                q_model: 0.54,
+                q_final: 0.53,
+                q_low: 0.51,
+                q_high: 0.55,
+                confidence: 1.0,
+                time_left_sec: 120.0,
+                proposed_stake: 1.2,
+                executed_stake: 1.2,
+                feature_summary: "{}",
+            })
+            .unwrap();
+        let intent_id = db
+            .insert_trade_intent(&TradeIntentRecord {
+                run_id: "r2",
+                decision_id,
+                timestamp_ms: 10,
+                contract_direction: "CALL",
+                proposed_stake: 1.2,
+                executed_stake: 1.2,
+                execution_enabled: true,
+                intent_status: "executed",
+                rejection_reason: None,
+            })
+            .unwrap();
+        db.insert_executed_trade(&ExecutedTradeRecord {
+            run_id: "r2",
+            trade_intent_id: intent_id,
+            timestamp_ms: 10,
+            contract_id: Some("c-open"),
+            contract_direction: "CALL",
+            stake: 1.2,
+            payout: None,
+            pnl: None,
+            exit_reason: None,
+            status: "open",
+        })
+        .unwrap();
+        let summary = db.trade_outcome_summary("r2").unwrap();
+        assert_eq!(
+            summary,
+            WinLossSummary {
+                wins: 0,
+                losses: 0,
+                open_trades: 1,
+                unresolved_trades: 0,
+                aborted_without_pnl: 0,
+                pnl_sum: 0.0,
+            }
+        );
     }
 }
