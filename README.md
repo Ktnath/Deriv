@@ -196,8 +196,15 @@ Win/loss reporting is intentionally conservative:
 
 ### Replay versus live
 
-- Replay uses the shared `DecisionEngine` and can optionally simulate execution. In execution-enabled replay, trades move through `proposed -> entered -> simulated_settled`, and the replay risk gate is closed when the simulated trade settles.
-- Live execution uses the same decision generation path, then hands transport and order lifecycle work to the existing trader FSM. Live settlement telemetry is written as the trade actually opens and closes; outcomes are not fabricated.
+- Replay uses the shared `DecisionEngine` in **replay-owned lifecycle mode**. In execution-enabled replay, the engine itself opens simulated trades, closes them at contract expiry, updates its internal `RiskGate`, and records `simulated_settled` outcomes.
+- Live execution uses the same decision generation path in **live-synchronized mode**. In this mode the executor and trader FSM remain the source of truth for order lifecycle, while the engine only keeps a synchronized risk view.
+- The executor now calls explicit synchronization hooks on the engine:
+  - `notify_live_balance(balance)` whenever Deriv sends an updated account balance,
+  - `notify_live_trade_opened(...)` after the trader FSM has a real open contract,
+  - `notify_live_trade_closed(...)` after settlement or early close with realized PnL,
+  - `notify_live_trade_aborted(...)` when a disconnect or interrupted execution invalidates the open trade.
+- This prevents live drift: Kelly sizing reads the latest synchronized live balance, open-position gating matches the trader FSM, and realized PnL is only applied once when the live trade truly closes.
+- On reconnect, the executor clears aborted live state through the same synchronization path so the engine does not keep a phantom open position.
 
 ## Offline reports
 
