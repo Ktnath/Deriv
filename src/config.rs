@@ -45,6 +45,17 @@ pub struct RecorderConfig {
 #[derive(Clone, Debug)]
 pub struct ResearchConfig {
     pub db_path: String,
+    pub contract_duration: u64,
+    pub min_stake: f64,
+    pub initial_balance: f64,
+    pub max_open_positions: usize,
+    pub max_daily_loss: f64,
+    pub cooldown_after_loss_ms: u64,
+    pub max_consecutive_losses: usize,
+    pub model_path: Option<String>,
+    pub allow_model_fallback: bool,
+    pub strategy_version: String,
+    pub prior_version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +199,47 @@ impl ResearchConfig {
             db_path: env::var("DERIV_RESEARCH_DB_PATH")
                 .or_else(|_| env::var("DERIV_RECORDER_DB_PATH"))
                 .unwrap_or_else(|_| "deriv_recorder.db".to_string()),
+            contract_duration: env::var("DERIV_CONTRACT_DURATION")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
+            min_stake: env::var("DERIV_MIN_STAKE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.35),
+            initial_balance: env::var("DERIV_INITIAL_BALANCE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10000.0),
+            max_open_positions: env::var("DERIV_MAX_POSITIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+            max_daily_loss: env::var("DERIV_MAX_DAILY_LOSS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50.0),
+            cooldown_after_loss_ms: env::var("DERIV_COOLDOWN_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
+            max_consecutive_losses: env::var("DERIV_MAX_CONSEC_LOSSES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5),
+            model_path: env::var("DERIV_MODEL_PATH")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            allow_model_fallback: env::var("DERIV_ALLOW_MODEL_FALLBACK")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(true),
+            strategy_version: env::var("DERIV_RESEARCH_STRATEGY_VERSION").unwrap_or_else(|_| {
+                env::var("DERIV_STRATEGY").unwrap_or_else(|_| "process".to_string())
+            }),
+            prior_version: env::var("DERIV_RESEARCH_PRIOR_VERSION")
+                .unwrap_or_else(|_| "process-v1".to_string()),
         }
     }
 }
