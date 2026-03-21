@@ -2,17 +2,21 @@ use crate::{
     config::ExecutorConfig,
     execution::trader::{PocAction, Trader},
     market_data::ticks::TickBuffer,
-    observability::{db::TelemetryDb, events, metrics::Metrics},
+    observability::{
+        db::{AlphaSignalRecord, DecisionSnapshotRecord, TelemetryDb},
+        events,
+        metrics::Metrics,
+    },
+    process::{FeatureExtractor, LiveDecisionInput, PriorEstimator, Regime},
     protocol::{
         self,
         responses::{parse_response, DerivResponse},
     },
     risk::{
-        alpha::{AlphaEngine, ModelMode},
+        alpha::{AlphaEngine, BlendConfig, BlendInputs, ModelMode},
         kelly::KellyRisk,
         ledger::Ledger,
         limits::RiskGate,
-        prior::{PriorEngine, PriorMode},
         settlement::Settlement,
     },
     server,
@@ -27,6 +31,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+const MIN_PROCESS_POINTS: usize = 48;
+
 pub async fn run_executor() -> anyhow::Result<()> {
     events::init_logging();
     let cfg = ExecutorConfig::from_env();
@@ -35,17 +41,15 @@ pub async fn run_executor() -> anyhow::Result<()> {
 }
 
 pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
-    let prior_engine = PriorEngine::new(cfg.market_prior);
+    let mut prior_estimator = PriorEstimator::new();
+    let mut feature_extractor = FeatureExtractor::new(512);
     let mut alpha = AlphaEngine::new(0.55, cfg.model_path.as_deref(), cfg.allow_model_fallback)?;
+    let blend_config = BlendConfig::default();
     let model_mode = match alpha.model_mode() {
         ModelMode::Onnx { path } => format!("onnx:{path}"),
         ModelMode::QuantOnly { reason } => format!("quant-only:{reason}"),
     };
-    let prior_mode = match prior_engine.mode() {
-        PriorMode::ModelOnly => "model_only".to_string(),
-        PriorMode::Fixed(prob) => format!("fixed:{:.4}", prob.0),
-    };
-    info!(symbol = %cfg.symbol, strategy = ?cfg.strategy, duration = cfg.contract_duration, duration_unit = %cfg.duration_unit, dry_run = cfg.dry_run, model_mode = %model_mode, model_path = ?cfg.model_path, allow_model_fallback = cfg.allow_model_fallback, prior_mode = %prior_mode, max_open_positions = cfg.max_open_positions, max_daily_loss = cfg.max_daily_loss, cooldown_ms = cfg.cooldown_after_loss_ms, max_consecutive_losses = cfg.max_consecutive_losses, min_stake = cfg.min_stake, stake_sizing_mode = "kelly_live", early_exit_loss_threshold_pct = cfg.stop_loss_pct * 100.0, "Startup configuration loaded");
+    info!(symbol = %cfg.symbol, primary_pipeline = "process_prior_alpha", strategy = ?cfg.strategy, duration = cfg.contract_duration, duration_unit = %cfg.duration_unit, dry_run = cfg.dry_run, model_mode = %model_mode, model_path = ?cfg.model_path, allow_model_fallback = cfg.allow_model_fallback, max_open_positions = cfg.max_open_positions, max_daily_loss = cfg.max_daily_loss, cooldown_ms = cfg.cooldown_after_loss_ms, max_consecutive_losses = cfg.max_consecutive_losses, min_stake = cfg.min_stake, stake_sizing_mode = "kelly_live", early_exit_loss_threshold_pct = cfg.stop_loss_pct * 100.0, legacy_strategy_mode = ?cfg.strategy, "Startup configuration loaded");
 
     let (telemetry_tx, _telemetry_rx) = broadcast::channel::<String>(100);
     tokio::spawn(server::start_server(
@@ -60,7 +64,7 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
         max_loss: cfg.initial_balance * 0.5,
         min_stake: cfg.min_stake,
     };
-    let mut strat = StrategyEngine::new(cfg.strategy);
+    let mut legacy_strategy = StrategyEngine::new(cfg.strategy);
     let mut ledger = Ledger::new(cfg.initial_balance);
     let mut risk_gate = RiskGate::new(
         cfg.max_open_positions,
@@ -136,7 +140,8 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                             }
                             tick_buf.push(tick.clone());
                             settlement.handle_tick(&tick);
-                            strat.on_tick(tick.price);
+                            legacy_strategy.on_tick(tick.price);
+                            feature_extractor.push_price(tick.price);
                             alpha.update_spot_return(tick.price, UnixMs(tick.epoch * 1000));
                             if contract_start.is_none() {
                                 contract_start = Some(now.0);
@@ -154,30 +159,64 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                             let est = settlement.estimate();
                             let Some(s0) = est.s0 else { continue; };
                             let Some(s_hat) = est.s_hat_t else { continue; };
-                            let q_model = alpha.calculate_q_model(s0, s_hat, time_left);
-                            let alpha_out = alpha.finalize_probability(q_model, prior_engine.current_prior(), 0.55);
-                            let risk_dec = kelly.size(alpha_out.q_low, Price(0.50), 0.5, risk_gate.balance);
-                            let signal = strat.generate_signal(&alpha_out, &risk_dec, time_left);
-                            if let Some(ref db) = db {
-                                let _ = db.insert_alpha_signal(now.0, Some(q_model.0), prior_engine.current_prior().map(|p| p.0), alpha_out.q_low.0, time_left);
+                            if !feature_extractor.is_ready(MIN_PROCESS_POINTS) {
+                                continue;
                             }
+                            let Some(features) = feature_extractor.extract() else { continue; };
+                            let process_snapshot = prior_estimator.update(&features, now);
+                            let q_model = alpha.calculate_q_model(s0, s_hat, time_left);
+                            let confidence_multiplier = 0.85 + process_snapshot.features.confidence_score() * 0.5;
+                            let alpha_out = alpha.finalize_probability(BlendInputs {
+                                model_probability: q_model,
+                                process_prior: Some(process_snapshot.prior),
+                                confidence_multiplier: Some(confidence_multiplier),
+                                config: blend_config,
+                            });
+                            let risk_dec = kelly.size(alpha_out.q_low, Price(0.50), 0.5, risk_gate.balance);
+                            let live_input = build_live_decision(&process_snapshot.regime, &process_snapshot.features, process_snapshot.prior, q_model, alpha_out.q_final, confidence_multiplier, time_left);
+                            let benchmark_signal = legacy_strategy.generate_signal(&alpha_out, &risk_dec, time_left);
+                            let signal = live_input.contract.map(Signal::Enter).unwrap_or(Signal::Hold);
+
+                            if let Some(ref db) = db {
+                                let _ = db.insert_alpha_signal(AlphaSignalRecord {
+                                    timestamp: now.0,
+                                    q_model: Some(q_model.0),
+                                    q_prior: Some(process_snapshot.prior.0),
+                                    q_final: alpha_out.q_final.0,
+                                    q_low: alpha_out.q_low.0,
+                                    q_high: alpha_out.q_high.0,
+                                    confidence: confidence_multiplier,
+                                    time_left_sec: time_left,
+                                    regime: process_snapshot.regime.as_str(),
+                                });
+                            }
+
                             let telemetry_msg = serde_json::json!({
-                                "type": "tick",
+                                "type": "decision",
                                 "price": tick.price,
                                 "time": tick.epoch,
-                                "signal": format!("{:?}", signal),
-                                "edge": format!("{:.4}", alpha_out.q_final.0 - 0.5),
-                                "pnl": format!("{:.2}", ledger.realized_pnl)
+                                "regime": process_snapshot.regime.as_str(),
+                                "prior": process_snapshot.prior.0,
+                                "q_model": q_model.0,
+                                "q_final": alpha_out.q_final.0,
+                                "edge": alpha_out.q_final.0 - 0.5,
+                                "decision": format!("{:?}", signal),
+                                "benchmark_signal": format!("{:?}", benchmark_signal),
+                                "pnl": ledger.realized_pnl
                             });
                             let _ = telemetry_tx.send(telemetry_msg.to_string());
+
+                            let mut rejection_reason = live_input.rejection_reason.clone();
+                            let edge = live_input.edge;
+                            let proposed_stake = risk_dec.max_size.0;
+                            let mut decision = "hold";
                             if let Signal::Enter(ct) = signal {
                                 if trader.is_idle() {
                                     let can = risk_gate.can_trade(now);
                                     if can.is_ok() && (now.0 - last_trade_time) > (cfg.contract_duration as i64 * 1000) {
-                                        let edge = alpha_out.q_final.0 - 0.5;
-                                        let proposed_stake = risk_dec.max_size.0;
                                         if proposed_stake < cfg.min_stake {
-                                            info!(predicted_probability = alpha_out.q_final.0, edge, proposed_stake, min_stake = cfg.min_stake, rejection = "below_min_stake", "Trade rejected by stake sizing");
+                                            rejection_reason = Some("below_min_stake".to_string());
+                                            info!(regime = %process_snapshot.regime.as_str(), predicted_probability = alpha_out.q_final.0, prior_probability = process_snapshot.prior.0, model_probability = q_model.0, edge, proposed_stake, min_stake = cfg.min_stake, rejection = "below_min_stake", "Trade rejected by stake sizing");
                                         } else {
                                             match trader.enter_trade(&SymbolId(cfg.symbol.clone()), ct, proposed_stake, cfg.contract_duration, &cfg.duration_unit).await {
                                                 Ok(()) => {
@@ -185,22 +224,65 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                                     risk_gate.on_trade_opened();
                                                     ledger.on_buy(ct, proposed_stake);
                                                     last_trade_time = now.0;
+                                                    decision = "enter";
+                                                    info!(regime = %process_snapshot.regime.as_str(), prior_probability = process_snapshot.prior.0, model_probability = q_model.0, final_probability = alpha_out.q_final.0, edge, contract = %ct, benchmark_signal = ?benchmark_signal, "Process-oriented trade entered");
                                                 }
                                                 Err(e) => {
-                                                    error!(error = %e, predicted_probability = alpha_out.q_final.0, edge, proposed_stake, "Trade execution failed");
+                                                    rejection_reason = Some(format!("execution_failed:{e}"));
+                                                    error!(error = %e, regime = %process_snapshot.regime.as_str(), predicted_probability = alpha_out.q_final.0, edge, proposed_stake, "Trade execution failed");
                                                     trader.reset();
                                                 }
                                             }
                                         }
                                     } else if let Err(rej) = can {
-                                        debug!(rejection = %rej, predicted_probability = alpha_out.q_final.0, edge = alpha_out.q_final.0 - 0.5, proposed_stake = risk_dec.max_size.0, executed_stake = 0.0, "Risk gate blocked trade");
+                                        rejection_reason = Some(rej.to_string());
+                                        debug!(rejection = %rej, regime = %process_snapshot.regime.as_str(), prior_probability = process_snapshot.prior.0, model_probability = q_model.0, final_probability = alpha_out.q_final.0, edge, proposed_stake, executed_stake = 0.0, "Risk gate blocked trade");
+                                    } else {
+                                        rejection_reason = Some("trade_cooldown_active".to_string());
                                     }
+                                } else {
+                                    rejection_reason = Some("trader_busy".to_string());
                                 }
                             }
+
+                            if let Some(ref db) = db {
+                                let feature_summary = serde_json::json!({
+                                    "sample_size": process_snapshot.features.sample_size,
+                                    "last_return": process_snapshot.features.last_return,
+                                    "short_drift": process_snapshot.features.short_drift,
+                                    "long_drift": process_snapshot.features.long_drift,
+                                    "drift_gap": process_snapshot.features.drift_gap,
+                                    "run_length": process_snapshot.features.run_length,
+                                    "sign_persistence": process_snapshot.features.sign_persistence,
+                                    "variance_ratio": process_snapshot.features.variance_ratio,
+                                    "return_clustering": process_snapshot.features.return_clustering,
+                                    "direction_concentration": process_snapshot.features.direction_concentration,
+                                    "shock_frequency": process_snapshot.features.shock_frequency,
+                                    "time_since_large_move": process_snapshot.features.time_since_large_move,
+                                    "move_zscore": process_snapshot.features.move_zscore,
+                                    "transition_instability": process_snapshot.features.transition_instability,
+                                    "benchmark_signal": format!("{:?}", benchmark_signal),
+                                }).to_string();
+                                let contract_direction = live_input.contract.map(|ct| ct.to_string());
+                                let _ = db.insert_decision_snapshot(DecisionSnapshotRecord {
+                                    timestamp: now.0,
+                                    symbol: &cfg.symbol,
+                                    regime: process_snapshot.regime.as_str(),
+                                    contract_direction: contract_direction.as_deref(),
+                                    decision,
+                                    rejection_reason: rejection_reason.as_deref(),
+                                    edge,
+                                    q_prior: process_snapshot.prior.0,
+                                    q_model: q_model.0,
+                                    q_final: alpha_out.q_final.0,
+                                    confidence: confidence_multiplier,
+                                    feature_summary: &feature_summary,
+                                });
+                            }
+
                             if now.0 - last_metrics_log > 10_000 {
                                 last_metrics_log = now.0;
-                                let regime = strat.evaluate_regime(time_left);
-                                info!(symbol = %cfg.symbol, regime, s0 = format!("{:.4}", s0), s_hat = format!("{:.4}", s_hat), q_model = format!("{:.4}", q_model.0), edge = format!("{:.4}", alpha_out.q_final.0 - 0.5), pnl = format!("{:.2}", ledger.realized_pnl), win_rate = format!("{:.1}%", ledger.win_rate() * 100.0), metrics = %metrics.summary(), "Executor status");
+                                info!(symbol = %cfg.symbol, regime = %process_snapshot.regime.as_str(), prior = format!("{:.4}", process_snapshot.prior.0), s0 = format!("{:.4}", s0), s_hat = format!("{:.4}", s_hat), q_model = format!("{:.4}", q_model.0), q_final = format!("{:.4}", alpha_out.q_final.0), edge = format!("{:.4}", alpha_out.q_final.0 - 0.5), benchmark_signal = ?benchmark_signal, pnl = format!("{:.2}", ledger.realized_pnl), win_rate = format!("{:.1}%", ledger.win_rate() * 100.0), metrics = %metrics.summary(), "Executor status");
                             }
                         }
                         DerivResponse::ProposalOpenContract { contract_id, is_sold, is_expired, is_valid_to_sell, profit, buy_price, .. } => {
@@ -293,5 +375,55 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
         contract_start = None;
         settlement.reset_s0();
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn build_live_decision(
+    regime: &Regime,
+    features: &crate::process::ProcessFeatures,
+    prior: Prob,
+    model_probability: Prob,
+    final_probability: Prob,
+    confidence_multiplier: f64,
+    time_left_sec: f64,
+) -> LiveDecisionInput {
+    let edge = final_probability.0 - 0.5;
+    let edge_threshold = match regime {
+        Regime::Calm => 0.035,
+        Regime::Transitional => 0.05,
+        Regime::Expansion => 0.065,
+    };
+    let mut rejection_reason = None;
+    let contract = if time_left_sec < 10.0 {
+        rejection_reason = Some("late_window".to_string());
+        None
+    } else if features.sample_size < 24 {
+        rejection_reason = Some("insufficient_process_history".to_string());
+        None
+    } else if features.transition_instability > 0.78 {
+        rejection_reason = Some("transition_instability".to_string());
+        None
+    } else if edge.abs() < edge_threshold {
+        rejection_reason = Some("edge_below_threshold".to_string());
+        None
+    } else if matches!(regime, Regime::Calm) && features.variance_ratio > 1.2 {
+        rejection_reason = Some("variance_out_of_regime".to_string());
+        None
+    } else if edge > 0.0 {
+        Some(ContractType::Call)
+    } else {
+        Some(ContractType::Put)
+    };
+
+    LiveDecisionInput {
+        regime: *regime,
+        prior,
+        model_probability,
+        final_probability,
+        confidence_multiplier,
+        edge,
+        contract,
+        rejection_reason,
+        features: features.clone(),
     }
 }

@@ -23,6 +23,33 @@ pub struct TelemetryDb {
     conn: Connection,
 }
 
+pub struct AlphaSignalRecord<'a> {
+    pub timestamp: i64,
+    pub q_model: Option<f64>,
+    pub q_prior: Option<f64>,
+    pub q_final: f64,
+    pub q_low: f64,
+    pub q_high: f64,
+    pub confidence: f64,
+    pub time_left_sec: f64,
+    pub regime: &'a str,
+}
+
+pub struct DecisionSnapshotRecord<'a> {
+    pub timestamp: i64,
+    pub symbol: &'a str,
+    pub regime: &'a str,
+    pub contract_direction: Option<&'a str>,
+    pub decision: &'a str,
+    pub rejection_reason: Option<&'a str>,
+    pub edge: f64,
+    pub q_prior: f64,
+    pub q_model: f64,
+    pub q_final: f64,
+    pub confidence: f64,
+    pub feature_summary: &'a str,
+}
+
 impl TelemetryDb {
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
@@ -89,10 +116,37 @@ impl TelemetryDb {
             "CREATE TABLE IF NOT EXISTS alpha_signals (
                 timestamp INTEGER PRIMARY KEY,
                 q_model REAL,
-                q_mkt REAL,
-                q_low REAL,
-                time_left_sec REAL
+                q_prior REAL,
+                q_final REAL NOT NULL,
+                q_low REAL NOT NULL,
+                q_high REAL NOT NULL,
+                confidence REAL NOT NULL,
+                time_left_sec REAL NOT NULL,
+                regime TEXT NOT NULL DEFAULT 'unknown'
             )",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS decision_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                contract_direction TEXT,
+                decision TEXT NOT NULL,
+                rejection_reason TEXT,
+                edge REAL NOT NULL,
+                q_prior REAL NOT NULL,
+                q_model REAL NOT NULL,
+                q_final REAL NOT NULL,
+                confidence REAL NOT NULL,
+                feature_summary TEXT NOT NULL
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_snapshots_symbol_time ON decision_snapshots(symbol, timestamp)",
             [],
         )?;
 
@@ -165,7 +219,7 @@ impl TelemetryDb {
                     last_event_time_ms: row.get(3)?,
                     min_price: row.get(4)?,
                     max_price: row.get(5)?,
-                })?
+                })
             })?
         } else {
             stmt.query_map([], |row| {
@@ -221,18 +275,43 @@ impl TelemetryDb {
         Ok(())
     }
 
-    pub fn insert_alpha_signal(
-        &self,
-        timestamp: i64,
-        q_model: Option<f64>,
-        q_mkt: Option<f64>,
-        q_low: f64,
-        time_left_sec: f64,
-    ) -> Result<()> {
+    pub fn insert_alpha_signal(&self, record: AlphaSignalRecord<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO alpha_signals (timestamp, q_model, q_mkt, q_low, time_left_sec)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (timestamp, q_model, q_mkt, q_low, time_left_sec),
+            "INSERT OR REPLACE INTO alpha_signals (timestamp, q_model, q_prior, q_final, q_low, q_high, confidence, time_left_sec, regime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.timestamp,
+                record.q_model,
+                record.q_prior,
+                record.q_final,
+                record.q_low,
+                record.q_high,
+                record.confidence,
+                record.time_left_sec,
+                record.regime,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_decision_snapshot(&self, record: DecisionSnapshotRecord<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO decision_snapshots (timestamp, symbol, regime, contract_direction, decision, rejection_reason, edge, q_prior, q_model, q_final, confidence, feature_summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                record.timestamp,
+                record.symbol,
+                record.regime,
+                record.contract_direction,
+                record.decision,
+                record.rejection_reason,
+                record.edge,
+                record.q_prior,
+                record.q_model,
+                record.q_final,
+                record.confidence,
+                record.feature_summary,
+            ],
         )?;
         Ok(())
     }
@@ -257,5 +336,45 @@ mod tests {
         let ticks = db.load_ticks("R_100", 10).unwrap();
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].source, "recorder");
+    }
+
+    #[test]
+    fn decision_snapshot_round_trip() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.insert_alpha_signal(AlphaSignalRecord {
+            timestamp: 10,
+            q_model: Some(0.54),
+            q_prior: Some(0.51),
+            q_final: 0.53,
+            q_low: 0.51,
+            q_high: 0.55,
+            confidence: 1.0,
+            time_left_sec: 120.0,
+            regime: "calm",
+        })
+        .unwrap();
+        db.insert_decision_snapshot(DecisionSnapshotRecord {
+            timestamp: 10,
+            symbol: "R_100",
+            regime: "calm",
+            contract_direction: Some("CALL"),
+            decision: "enter",
+            rejection_reason: None,
+            edge: 0.03,
+            q_prior: 0.51,
+            q_model: 0.54,
+            q_final: 0.53,
+            confidence: 1.0,
+            feature_summary: r#"{"run_length":4}"#,
+        })
+        .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM decision_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

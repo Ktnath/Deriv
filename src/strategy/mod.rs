@@ -260,6 +260,7 @@ impl StrategyEngine {
         }
 
         match self.strategy_type {
+            StrategyType::Process => self.temporal_signal(alpha, time_left_sec),
             StrategyType::Temporal => self.temporal_signal(alpha, time_left_sec),
             StrategyType::Rsi => self.legacy_rsi_signal(),
             StrategyType::BollingerBands => self.legacy_bb_signal(),
@@ -419,7 +420,7 @@ impl StrategyEngine {
         final_sig
     }
 
-    // ── Legacy strategies (kept for backward compat) ─────────────────
+    // ── Compatibility / benchmark strategies (kept for backward compat) ─
 
     fn temporal_signal(&self, alpha: &AlphaOutput, time_left_sec: f64) -> Signal {
         let edge_up = alpha.q_final.0 - 0.5;

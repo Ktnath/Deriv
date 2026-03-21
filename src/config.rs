@@ -98,7 +98,7 @@ impl ExecutorConfig {
             strategy: env::var("DERIV_STRATEGY")
                 .ok()
                 .and_then(|s| StrategyType::from_str(&s).ok())
-                .unwrap_or(StrategyType::Temporal),
+                .unwrap_or(StrategyType::Process),
             contract_duration: env::var("DERIV_CONTRACT_DURATION")
                 .ok()
                 .and_then(|s| s.parse().ok())

@@ -3,6 +3,7 @@ pub mod config;
 pub mod execution;
 pub mod market_data;
 pub mod observability;
+pub mod process;
 pub mod protocol;
 pub mod risk;
 pub mod server;
