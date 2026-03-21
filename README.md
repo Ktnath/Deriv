@@ -41,9 +41,9 @@ cargo run --bin research -- report <run_id>
 Replay responsibilities in this PR:
 
 - load historical ticks deterministically from SQLite,
-- run the same decision-stage probability / prior / regime / stake proposal flow offline,
-- separate **decision** from **execution** by allowing signal-only mode,
-- persist experiment metadata and replay outputs for later comparison,
+- run the same shared `DecisionEngine` probability / prior / regime / stake proposal flow used by live execution,
+- separate **decision** from **execution** by allowing signal-only mode or simulated execution mode,
+- persist experiment metadata plus proposed / entered / settled replay lifecycle telemetry for later comparison,
 - print baseline offline summaries for quick validation.
 
 ### 3. Executor
@@ -57,9 +57,9 @@ DERIV_API_TOKEN=... DERIV_APP_ID=... cargo run --bin executor
 Executor responsibilities:
 
 - connect to Deriv live services,
-- evaluate the decision pipeline,
+- evaluate decisions through the shared `DecisionEngine`,
 - place trades through the existing trader FSM,
-- persist decision and intent telemetry alongside execution outcomes.
+- persist decision, intent, and executed-trade lifecycle telemetry alongside execution outcomes.
 
 ## Key environment variables
 
@@ -135,12 +135,59 @@ The SQLite layer now keeps experiment-oriented data in a more normalized layout.
 
 This design keeps raw ticks and experiment metadata normalized instead of forcing every concept into one sparse table.
 
+
+## Decision / intent / trade semantics
+
+The project now treats decision generation and execution telemetry as separate layers:
+
+- `decision_events.decision`
+  - `hold` — no actionable entry was produced or the entry was blocked.
+  - `signal` — the shared decision engine produced an actionable entry intent, but no execution happened yet.
+  - `enter` — an actionable decision was actually entered.
+- `trade_intents.intent_status`
+  - `signal_only` — replay or audit-only signal with no execution attempt.
+  - `rejected` — an intent existed, but risk / timing / lifecycle checks blocked it.
+  - `submitted` — live execution attempted to route the intent through the trader FSM.
+  - `executed` — a trade was actually opened.
+- `executed_trades.status`
+  - `open` — trade is currently open.
+  - `settled` — live trade settled naturally.
+  - `closed_early` — live trade was sold before expiry.
+  - `aborted` — live execution attempt was interrupted before a clean close.
+  - `simulated_settled` — replay execution completed through the simulated lifecycle.
+
+### Benchmark semantics
+
+`benchmark_signal` is now a normalized comparator derived from the same shared decision contract in both replay and live paths:
+
+- `CALL` when the shared decision logic points long,
+- `PUT` when it points short,
+- `HOLD` when the shared decision logic rejects entry.
+
+It is no longer allowed to drift between a legacy live-only strategy output and a replay-only placeholder.
+
+### Report semantics
+
+Reports distinguish between:
+
+- **decisions** — rows in `decision_events`,
+- **signal intents** — non-executed but actionable `trade_intents`,
+- **trades** — rows in `executed_trades` only.
+
+So a `signal` does **not** count as a trade in reports.
+
+### Replay versus live
+
+- Replay uses the shared `DecisionEngine` and can optionally simulate execution. In execution-enabled replay, trades move through `proposed -> entered -> simulated_settled`, and the replay risk gate is closed when the simulated trade settles.
+- Live execution uses the same decision generation path, then hands transport and order lifecycle work to the existing trader FSM. Live settlement telemetry is written as the trade actually opens and closes; outcomes are not fabricated.
+
 ## Offline reports
 
 `research report` prints practical baseline metrics including:
 
 - decision count,
-- trade count,
+- signal-intent count,
+- executed trade count,
 - average edge,
 - PnL summary,
 - win/loss summary,
