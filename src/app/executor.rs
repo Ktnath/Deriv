@@ -24,12 +24,26 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Live,
+    DryRun,
+}
+
 #[derive(Debug, Clone)]
 struct PendingExecutionTelemetry {
     intent_id: i64,
     executed_trade_id: i64,
     stake: f64,
     contract_type: ContractType,
+    mode: ExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    NaturalExpiry,
+    EarlyExit,
+    DryRunExpiry,
 }
 
 pub async fn run_executor() -> anyhow::Result<()> {
@@ -170,13 +184,27 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                                         opened_at_ms,
                                                     );
                                                     if let Some(ref db) = db {
-                                                        pending_execution = persist_live_execution_open(
+                                                        pending_execution = persist_execution_open(
                                                             db,
                                                             &run_id,
                                                             &decision,
                                                             contract_type,
                                                             &trader,
+                                                            if cfg.dry_run { ExecutionMode::DryRun } else { ExecutionMode::Live },
                                                         ).ok();
+                                                    }
+                                                    if cfg.dry_run {
+                                                        settle_trade(
+                                                            &mut engine,
+                                                            &mut pending_execution,
+                                                            &db,
+                                                            &trader,
+                                                            0.0,
+                                                            CloseReason::DryRunExpiry,
+                                                            &metrics,
+                                                            &mut ledger,
+                                                        );
+                                                        trader.reset();
                                                     }
                                                     info!(regime = %decision.regime, q_final = decision.q_final, edge = decision.edge, benchmark_signal = %decision.benchmark_signal, contract = %decision.contract_direction.as_deref().unwrap_or("NONE"), "DecisionEngine trade entered");
                                                 } else {
@@ -222,12 +250,30 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                             continue;
                                         }
                                     };
-                                    settle_live_trade(&mut engine, &mut pending_execution, &db, &trader, pnl, "closed_early", Some("stop_loss_exit"), &metrics, &mut ledger);
+                                    settle_trade(
+                                        &mut engine,
+                                        &mut pending_execution,
+                                        &db,
+                                        &trader,
+                                        pnl,
+                                        CloseReason::EarlyExit,
+                                        &metrics,
+                                        &mut ledger,
+                                    );
                                     trader.reset();
                                     info!(contract_id = %cid, pnl, "Contract sold early after early-exit loss threshold");
                                 }
                                 PocAction::Settled(pnl) => {
-                                    settle_live_trade(&mut engine, &mut pending_execution, &db, &trader, pnl, "settled", Some("contract_expired"), &metrics, &mut ledger);
+                                    settle_trade(
+                                        &mut engine,
+                                        &mut pending_execution,
+                                        &db,
+                                        &trader,
+                                        pnl,
+                                        CloseReason::NaturalExpiry,
+                                        &metrics,
+                                        &mut ledger,
+                                    );
                                     trader.reset();
                                     info!(contract_id = %contract_id, profit = pnl, "Contract settled naturally");
                                 }
@@ -464,12 +510,13 @@ fn persist_live_rejected_intent(
     Ok(())
 }
 
-fn persist_live_execution_open(
+fn persist_execution_open(
     db: &TelemetryDb,
     run_id: &str,
     decision: &DecisionContext,
     contract_type: ContractType,
     trader: &Trader,
+    mode: ExecutionMode,
 ) -> rusqlite::Result<PendingExecutionTelemetry> {
     let decision_id = db.insert_run_decision(&RunDecisionRecord {
         run_id,
@@ -504,7 +551,11 @@ fn persist_live_execution_open(
         proposed_stake: decision.proposed_stake,
         executed_stake: 0.0,
         execution_enabled: true,
-        intent_status: "submitted",
+        intent_status: if mode == ExecutionMode::DryRun {
+            "dry_run_executed"
+        } else {
+            "submitted"
+        },
         rejection_reason: None,
     })?;
     let executed_trade_id = db.insert_executed_trade(&ExecutedTradeRecord {
@@ -520,24 +571,28 @@ fn persist_live_execution_open(
         payout: trader.active_trade.as_ref().and_then(|t| t.payout),
         pnl: None,
         exit_reason: None,
-        status: "open",
+        status: if mode == ExecutionMode::DryRun {
+            "dry_run_open"
+        } else {
+            "open"
+        },
     })?;
     Ok(PendingExecutionTelemetry {
         intent_id,
         executed_trade_id,
         stake: decision.proposed_stake,
         contract_type,
+        mode,
     })
 }
 
-fn settle_live_trade(
+fn settle_trade(
     engine: &mut DecisionEngine,
     pending_execution: &mut Option<PendingExecutionTelemetry>,
     db: &Option<Arc<TelemetryDb>>,
     trader: &Trader,
     pnl: f64,
-    status: &str,
-    exit_reason: Option<&str>,
+    close_reason: CloseReason,
     metrics: &Metrics,
     ledger: &mut Ledger,
 ) {
@@ -547,23 +602,53 @@ fn settle_live_trade(
         metrics.inc_losses();
     }
     if let Some(pending) = pending_execution.take() {
-        let payout = trader
-            .active_trade
-            .as_ref()
-            .and_then(|t| t.payout)
-            .map(|p| if pnl > 0.0 { p } else { 0.0 });
+        let (trade_status, intent_status, exit_reason, payout) = match pending.mode {
+            ExecutionMode::Live => {
+                let (trade_status, exit_reason) = match close_reason {
+                    CloseReason::NaturalExpiry => ("settled", Some("contract_expired")),
+                    CloseReason::EarlyExit => ("closed_early", Some("stop_loss_exit")),
+                    CloseReason::DryRunExpiry => ("settled", Some("contract_expired")),
+                };
+                (
+                    trade_status,
+                    "executed",
+                    exit_reason,
+                    trader
+                        .active_trade
+                        .as_ref()
+                        .and_then(|t| t.payout)
+                        .map(|p| {
+                            if trade_status == "settled" && pnl > 0.0 {
+                                p
+                            } else {
+                                0.0
+                            }
+                        }),
+                )
+            }
+            ExecutionMode::DryRun => (
+                "dry_run_settled",
+                "dry_run_executed",
+                Some("dry_run_simulated_expiry"),
+                Some(pending.stake + pnl),
+            ),
+        };
         ledger.on_settle(pending.contract_type, payout.unwrap_or(0.0), pending.stake);
         engine.notify_live_trade_closed(pnl, UnixMs::now().0, Some(ledger.cash));
         if let Some(db) = db {
-            let _ =
-                db.update_trade_intent_status(pending.intent_id, "executed", pending.stake, None);
+            let _ = db.update_trade_intent_status(
+                pending.intent_id,
+                intent_status,
+                pending.stake,
+                None,
+            );
             let _ = db.update_executed_trade_lifecycle(
                 pending.executed_trade_id,
                 UnixMs::now().0,
                 payout,
                 Some(pnl),
                 exit_reason,
-                status,
+                trade_status,
             );
         }
     }
@@ -684,22 +769,195 @@ mod tests {
             executed_trade_id: 1,
             stake: 1.2,
             contract_type: ContractType::Call,
+            mode: ExecutionMode::Live,
         });
 
-        settle_live_trade(
+        settle_trade(
             &mut engine,
             &mut pending,
             &None,
             &trader,
             1.14,
-            "settled",
-            Some("contract_expired"),
+            CloseReason::NaturalExpiry,
             &metrics,
             &mut ledger,
         );
 
         assert!(pending.is_none());
         assert!(!engine.live_position_is_open());
+    }
+
+    #[tokio::test]
+    async fn dry_run_execution_persists_open_then_settled_lifecycle() {
+        let db = Arc::new(TelemetryDb::new(":memory:").unwrap());
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "dry-run".into(),
+            binary_type: "executor".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "fp".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+
+        let mut engine = DecisionEngine::new_live(DecisionEngineConfig {
+            symbol: "R_100".into(),
+            contract_duration: 5,
+            min_stake: 0.35,
+            initial_balance: 100.0,
+            max_open_positions: 1,
+            max_daily_loss: 100.0,
+            cooldown_after_loss_ms: 0,
+            max_consecutive_losses: 10,
+            model_path: None,
+            allow_model_fallback: true,
+            strategy_mode: "process".into(),
+            prior_mode: "process-v1".into(),
+        })
+        .unwrap();
+        let router = Arc::new(Router::new(tokio::sync::mpsc::channel(1).0));
+        let mut trader = Trader::new(router, true, 0.5);
+        trader
+            .enter_trade(&SymbolId("R_100".into()), ContractType::Call, 1.2, 5, "s")
+            .await
+            .unwrap();
+        assert_eq!(trader.current_state(), TradeState::Open);
+
+        let decision = sample_decision();
+        engine.notify_live_trade_opened(
+            trader
+                .active_trade
+                .as_ref()
+                .and_then(|t| t.contract_id.clone()),
+            "CALL",
+            1.2,
+            decision.ts_ms,
+        );
+        let persisted = persist_execution_open(
+            &db,
+            "dry-run",
+            &decision,
+            ContractType::Call,
+            &trader,
+            ExecutionMode::DryRun,
+        )
+        .unwrap();
+
+        assert_eq!(db.count_rows("decision_events", "dry-run").unwrap(), 1);
+        assert_eq!(
+            db.count_trade_intents_by_status("dry-run", "dry_run_executed")
+                .unwrap(),
+            1
+        );
+        assert!(engine.live_position_is_open());
+
+        let metrics = Metrics::new();
+        let mut ledger = Ledger::new(100.0);
+        ledger.on_buy(ContractType::Call, 1.2);
+        let mut pending = Some(persisted);
+        settle_trade(
+            &mut engine,
+            &mut pending,
+            &Some(Arc::clone(&db)),
+            &trader,
+            0.0,
+            CloseReason::DryRunExpiry,
+            &metrics,
+            &mut ledger,
+        );
+
+        assert!(pending.is_none());
+        assert!(!engine.live_position_is_open());
+        assert_eq!(
+            db.count_executed_trades_by_status("dry-run", "dry_run_settled")
+                .unwrap(),
+            1
+        );
+        let dry_run_contract_ids = db.executed_trade_contract_ids("dry-run").unwrap();
+        assert!(dry_run_contract_ids
+            .iter()
+            .all(|id| id.starts_with("dry_run:")));
+    }
+
+    #[tokio::test]
+    async fn multiple_dry_run_trades_do_not_leave_stale_open_state() {
+        let db = Arc::new(TelemetryDb::new(":memory:").unwrap());
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "dry-run-multi".into(),
+            binary_type: "executor".into(),
+            model_version: "quant-only".into(),
+            strategy_version: "process".into(),
+            prior_version: "process-v1".into(),
+            config_fingerprint: "fp".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+        let mut engine = DecisionEngine::new_live(DecisionEngineConfig {
+            symbol: "R_100".into(),
+            contract_duration: 5,
+            min_stake: 0.35,
+            initial_balance: 100.0,
+            max_open_positions: 1,
+            max_daily_loss: 100.0,
+            cooldown_after_loss_ms: 0,
+            max_consecutive_losses: 10,
+            model_path: None,
+            allow_model_fallback: true,
+            strategy_mode: "process".into(),
+            prior_mode: "process-v1".into(),
+        })
+        .unwrap();
+        let metrics = Metrics::new();
+        let mut ledger = Ledger::new(100.0);
+
+        for ts in [10_i64, 20_i64] {
+            let router = Arc::new(Router::new(tokio::sync::mpsc::channel(1).0));
+            let mut trader = Trader::new(router, true, 0.5);
+            trader
+                .enter_trade(&SymbolId("R_100".into()), ContractType::Call, 1.2, 5, "s")
+                .await
+                .unwrap();
+            let mut decision = sample_decision();
+            decision.ts_ms = ts;
+            engine.notify_live_trade_opened(
+                trader
+                    .active_trade
+                    .as_ref()
+                    .and_then(|t| t.contract_id.clone()),
+                "CALL",
+                1.2,
+                ts,
+            );
+            let pending = persist_execution_open(
+                &db,
+                "dry-run-multi",
+                &decision,
+                ContractType::Call,
+                &trader,
+                ExecutionMode::DryRun,
+            )
+            .unwrap();
+            ledger.on_buy(ContractType::Call, 1.2);
+            let mut pending = Some(pending);
+            settle_trade(
+                &mut engine,
+                &mut pending,
+                &Some(Arc::clone(&db)),
+                &trader,
+                0.0,
+                CloseReason::DryRunExpiry,
+                &metrics,
+                &mut ledger,
+            );
+            assert!(!engine.live_position_is_open());
+        }
+
+        assert_eq!(
+            db.count_executed_trades_by_status("dry-run-multi", "dry_run_settled")
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
