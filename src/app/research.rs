@@ -1,16 +1,29 @@
 use crate::{
+    app::decision_engine::{DecisionContext, DecisionEngine, DecisionEngineConfig},
     config::ResearchConfig,
-    observability::{db::TelemetryDb, events},
+    observability::db::{
+        ExecutedTradeRecord, RunDecisionRecord, RunMetadata, TelemetryDb, TradeIntentRecord,
+    },
+    process::Regime,
+    types::TickUpdate,
 };
 use chrono::{TimeZone, Utc};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub fn run_research_cli(args: &[String]) -> anyhow::Result<()> {
-    events::init_logging();
+    crate::observability::events::init_logging();
     let cfg = ResearchConfig::from_env();
     let db = TelemetryDb::new(&cfg.db_path)?;
     match parse_command(args) {
         ResearchCommand::Summarize { symbol } => summarize(&db, symbol.as_deref()),
-        ResearchCommand::Replay { symbol, limit } => replay(&db, &symbol, limit),
+        ResearchCommand::Replay {
+            symbol,
+            limit,
+            persist,
+            execution_mode,
+        } => replay(&db, &cfg, &symbol, limit, persist, execution_mode),
+        ResearchCommand::Report { run_id } => report(&db, run_id.as_deref()),
         ResearchCommand::InspectRegimes { symbol, window } => inspect_regimes(&db, &symbol, window),
         ResearchCommand::Help => {
             print_help();
@@ -21,9 +34,22 @@ pub fn run_research_cli(args: &[String]) -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResearchCommand {
-    Summarize { symbol: Option<String> },
-    Replay { symbol: String, limit: usize },
-    InspectRegimes { symbol: String, window: usize },
+    Summarize {
+        symbol: Option<String>,
+    },
+    Replay {
+        symbol: String,
+        limit: usize,
+        persist: bool,
+        execution_mode: bool,
+    },
+    Report {
+        run_id: Option<String>,
+    },
+    InspectRegimes {
+        symbol: String,
+        window: usize,
+    },
     Help,
 }
 
@@ -34,7 +60,12 @@ fn parse_command(args: &[String]) -> ResearchCommand {
         },
         Some("replay") => ResearchCommand::Replay {
             symbol: args.get(1).cloned().unwrap_or_else(|| "R_100".to_string()),
-            limit: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(25),
+            limit: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(250),
+            persist: !args.iter().any(|arg| arg == "--no-persist"),
+            execution_mode: args.iter().any(|arg| arg == "--with-execution"),
+        },
+        Some("report") => ResearchCommand::Report {
+            run_id: args.get(1).cloned(),
         },
         Some("inspect-regimes") => ResearchCommand::InspectRegimes {
             symbol: args.get(1).cloned().unwrap_or_else(|| "R_100".to_string()),
@@ -64,21 +95,183 @@ fn summarize(db: &TelemetryDb, symbol: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn replay(db: &TelemetryDb, symbol: &str, limit: usize) -> anyhow::Result<()> {
+fn replay(
+    db: &TelemetryDb,
+    cfg: &ResearchConfig,
+    symbol: &str,
+    limit: usize,
+    persist: bool,
+    execution_mode: bool,
+) -> anyhow::Result<()> {
     let ticks = db.load_ticks(symbol, limit)?;
     if ticks.is_empty() {
         println!("No ticks found for symbol={symbol}.");
         return Ok(());
     }
+    let run = RunMetadata {
+        run_id: format!(
+            "research-{}-{}",
+            symbol,
+            ticks.first().map(|t| t.event_time_ms).unwrap_or(0)
+        ),
+        binary_type: "research".into(),
+        model_version: cfg
+            .model_path
+            .clone()
+            .unwrap_or_else(|| "quant-only".into()),
+        strategy_version: cfg.strategy_version.clone(),
+        prior_version: cfg.prior_version.clone(),
+        config_fingerprint: cfg.config_fingerprint(),
+        started_at_ms: Utc::now().timestamp_millis(),
+    };
+    if persist {
+        db.upsert_run_metadata(&run)?;
+    }
+    let mut engine = DecisionEngine::new(DecisionEngineConfig {
+        symbol: symbol.to_string(),
+        contract_duration: cfg.contract_duration,
+        min_stake: cfg.min_stake,
+        initial_balance: cfg.initial_balance,
+        max_open_positions: cfg.max_open_positions,
+        max_daily_loss: cfg.max_daily_loss,
+        cooldown_after_loss_ms: cfg.cooldown_after_loss_ms,
+        max_consecutive_losses: cfg.max_consecutive_losses,
+        model_path: cfg.model_path.clone(),
+        allow_model_fallback: cfg.allow_model_fallback,
+        strategy_mode: cfg.strategy_version.clone(),
+        prior_mode: cfg.prior_version.clone(),
+    })?;
+    let mut seen = 0;
     for tick in ticks {
-        println!(
-            "{} symbol={} price={:.5} source={} latency_ms={}",
-            fmt_ms(tick.event_time_ms),
-            tick.symbol,
-            tick.price,
-            tick.source,
-            tick.received_at_ms - tick.event_time_ms
-        );
+        let update = TickUpdate {
+            symbol: tick.symbol,
+            price: tick.price,
+            epoch: tick.event_time_ms / 1000,
+        };
+        if let Some(decision) = engine.step(&update, execution_mode) {
+            seen += 1;
+            println!("{} decision={} direction={} edge={:.4} proposed_stake={:.2} regime={} rejection={}", fmt_ms(decision.ts_ms), decision.decision, decision.contract_direction.as_deref().unwrap_or("NONE"), decision.edge, decision.proposed_stake, decision.regime, decision.rejection_reason.as_deref().unwrap_or("none"));
+            if persist {
+                persist_decision_bundle(db, &run.run_id, &decision)?;
+            }
+        }
+    }
+    println!(
+        "replay_complete run_id={} symbol={} ticks={} decisions={} persist={} execution_mode={}",
+        run.run_id, symbol, limit, seen, persist, execution_mode
+    );
+    if persist {
+        print_report(db, &run.run_id)?;
+    }
+    Ok(())
+}
+
+fn persist_decision_bundle(
+    db: &TelemetryDb,
+    run_id: &str,
+    decision: &DecisionContext,
+) -> anyhow::Result<()> {
+    let decision_id = db.insert_run_decision(&RunDecisionRecord {
+        run_id,
+        timestamp_ms: decision.ts_ms,
+        symbol: &decision.symbol,
+        price: decision.price,
+        regime: &decision.regime,
+        prior_mode: &decision.prior_mode,
+        strategy_mode: &decision.strategy_mode,
+        model_metadata: &decision.model_metadata,
+        contract_direction: decision.contract_direction.as_deref(),
+        benchmark_signal: &decision.benchmark_signal,
+        decision: &decision.decision,
+        rejection_reason: decision.rejection_reason.as_deref(),
+        edge: decision.edge,
+        q_prior: decision.prior,
+        q_model: decision.q_model,
+        q_final: decision.q_final,
+        q_low: decision.q_low,
+        q_high: decision.q_high,
+        confidence: decision.confidence,
+        time_left_sec: decision.time_left_sec,
+        proposed_stake: decision.proposed_stake,
+        executed_stake: decision.executed_stake,
+        feature_summary: &decision.feature_summary,
+    })?;
+    if let Some(direction) = decision.contract_direction.as_deref() {
+        let intent_status = if decision.executed_stake > 0.0 {
+            "executed"
+        } else if decision.decision == "signal" {
+            "signal_only"
+        } else {
+            "rejected"
+        };
+        let intent_id = db.insert_trade_intent(&TradeIntentRecord {
+            run_id,
+            decision_id,
+            timestamp_ms: decision.ts_ms,
+            contract_direction: direction,
+            proposed_stake: decision.proposed_stake,
+            executed_stake: decision.executed_stake,
+            execution_enabled: decision.execution_enabled,
+            intent_status,
+            rejection_reason: decision.rejection_reason.as_deref(),
+        })?;
+        if decision.executed_stake > 0.0 {
+            let pnl = simulated_pnl(direction, decision.edge, decision.executed_stake);
+            db.insert_executed_trade(&ExecutedTradeRecord {
+                run_id,
+                trade_intent_id: intent_id,
+                timestamp_ms: decision.ts_ms,
+                contract_id: None,
+                contract_direction: direction,
+                stake: decision.executed_stake,
+                payout: Some(decision.executed_stake + pnl),
+                pnl: Some(pnl),
+                exit_reason: Some(if pnl >= 0.0 {
+                    "replay_positive_edge"
+                } else {
+                    "replay_negative_edge"
+                }),
+                status: "simulated_settled",
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn simulated_pnl(_direction: &str, edge: f64, stake: f64) -> f64 {
+    (edge * 2.0 * stake).clamp(-stake, stake)
+}
+
+fn report(db: &TelemetryDb, run_id: Option<&str>) -> anyhow::Result<()> {
+    let run_id = match run_id {
+        Some(id) => id.to_string(),
+        None => db
+            .latest_run_id_for_binary("research")?
+            .unwrap_or_else(|| "".into()),
+    };
+    if run_id.is_empty() {
+        println!("No research runs found.");
+        return Ok(());
+    }
+    print_report(db, &run_id)
+}
+
+fn print_report(db: &TelemetryDb, run_id: &str) -> anyhow::Result<()> {
+    let summary = db.latest_run_report(run_id)?;
+    let (wins, losses, pnl) = db.win_loss_summary(run_id)?;
+    println!("report run_id={run_id}");
+    println!(
+        "  decisions={} trades={} avg_edge={:.5} pnl={:.4}",
+        summary.decisions, summary.trades, summary.average_edge, pnl
+    );
+    println!("  wins={} losses={}", wins, losses);
+    println!("  regimes:");
+    for (regime, count) in db.regime_counts(run_id)? {
+        println!("    {regime}: {count}");
+    }
+    println!("  rejection_reasons:");
+    for (reason, count) in db.rejection_counts(run_id)? {
+        println!("    {reason}: {count}");
     }
     Ok(())
 }
@@ -121,12 +314,32 @@ fn fmt_ms(ts_ms: i64) -> String {
 }
 
 fn print_help() {
-    println!("research <subcommand>\n\nSubcommands:\n  summarize [symbol]\n  replay [symbol] [limit]\n  inspect-regimes [symbol] [window]");
+    println!("research <subcommand>\n\nSubcommands:\n  summarize [symbol]\n  replay [symbol] [limit] [--no-persist] [--with-execution]\n  report [run_id]\n  inspect-regimes [symbol] [window]");
+}
+
+impl ResearchConfig {
+    fn config_fingerprint(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.db_path.hash(&mut hasher);
+        self.contract_duration.hash(&mut hasher);
+        self.min_stake.to_bits().hash(&mut hasher);
+        self.initial_balance.to_bits().hash(&mut hasher);
+        self.max_open_positions.hash(&mut hasher);
+        self.max_daily_loss.to_bits().hash(&mut hasher);
+        self.cooldown_after_loss_ms.hash(&mut hasher);
+        self.max_consecutive_losses.hash(&mut hasher);
+        self.model_path.hash(&mut hasher);
+        self.allow_model_fallback.hash(&mut hasher);
+        self.strategy_version.hash(&mut hasher);
+        self.prior_version.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::db::TelemetryDb;
 
     #[test]
     fn parse_known_commands() {
@@ -135,18 +348,72 @@ mod tests {
             ResearchCommand::Summarize { symbol: None }
         );
         assert_eq!(
-            parse_command(&["replay".into(), "R_50".into(), "10".into()]),
+            parse_command(&[
+                "replay".into(),
+                "R_50".into(),
+                "10".into(),
+                "--with-execution".into()
+            ]),
             ResearchCommand::Replay {
                 symbol: "R_50".into(),
-                limit: 10
+                limit: 10,
+                persist: true,
+                execution_mode: true
             }
         );
         assert_eq!(
-            parse_command(&["inspect-regimes".into(), "R_75".into()]),
-            ResearchCommand::InspectRegimes {
-                symbol: "R_75".into(),
-                window: 50
+            parse_command(&["report".into(), "run-1".into()]),
+            ResearchCommand::Report {
+                run_id: Some("run-1".into())
             }
         );
+    }
+
+    #[test]
+    fn report_aggregates_fixture_run() {
+        let db = TelemetryDb::new(":memory:").unwrap();
+        db.upsert_run_metadata(&RunMetadata {
+            run_id: "fixture".into(),
+            binary_type: "research".into(),
+            model_version: "m1".into(),
+            strategy_version: "s1".into(),
+            prior_version: "p1".into(),
+            config_fingerprint: "fp".into(),
+            started_at_ms: 1,
+        })
+        .unwrap();
+        persist_decision_bundle(
+            &db,
+            "fixture",
+            &DecisionContext {
+                ts_ms: 1,
+                symbol: "R_100".into(),
+                price: 100.0,
+                regime: Regime::Calm.as_str().into(),
+                prior: 0.51,
+                q_model: 0.55,
+                q_final: 0.54,
+                q_low: 0.52,
+                q_high: 0.56,
+                confidence: 1.0,
+                edge: 0.04,
+                time_left_sec: 120.0,
+                contract_direction: Some("CALL".into()),
+                benchmark_signal: "CALL".into(),
+                decision: "signal".into(),
+                rejection_reason: None,
+                proposed_stake: 1.0,
+                executed_stake: 0.0,
+                execution_enabled: false,
+                prior_mode: "prior-v1".into(),
+                strategy_mode: "strategy-v1".into(),
+                model_metadata: "quant-only".into(),
+                feature_summary: "{}".into(),
+            },
+        )
+        .unwrap();
+        let report = db.latest_run_report("fixture").unwrap();
+        assert_eq!(report.decisions, 1);
+        assert_eq!(report.trades, 1);
     }
 }
