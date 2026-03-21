@@ -59,6 +59,20 @@ pub struct SimulatedTradeSettlement {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+struct LivePosition {
+    contract_id: Option<String>,
+    direction: String,
+    stake: f64,
+    opened_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+enum LifecycleMode {
+    Replay { open_trade: Option<SimulatedTrade> },
+    LiveSynchronized { open_position: Option<LivePosition> },
+}
+
 pub struct DecisionEngine {
     symbol: String,
     contract_duration: u64,
@@ -75,7 +89,7 @@ pub struct DecisionEngine {
     risk_gate: RiskGate,
     last_trade_time: i64,
     contract_start: Option<i64>,
-    open_simulated_trade: Option<SimulatedTrade>,
+    lifecycle: LifecycleMode,
 }
 
 pub struct DecisionEngineConfig {
@@ -95,6 +109,14 @@ pub struct DecisionEngineConfig {
 
 impl DecisionEngine {
     pub fn new(cfg: DecisionEngineConfig) -> anyhow::Result<Self> {
+        Self::new_with_mode(cfg, false)
+    }
+
+    pub fn new_live(cfg: DecisionEngineConfig) -> anyhow::Result<Self> {
+        Self::new_with_mode(cfg, true)
+    }
+
+    fn new_with_mode(cfg: DecisionEngineConfig, live_synchronized: bool) -> anyhow::Result<Self> {
         let alpha = AlphaEngine::new(0.55, cfg.model_path.as_deref(), cfg.allow_model_fallback)?;
         let model_metadata = match alpha.model_mode() {
             crate::risk::alpha::ModelMode::Onnx { path } => format!("onnx:{path}"),
@@ -126,8 +148,100 @@ impl DecisionEngine {
             ),
             last_trade_time: 0,
             contract_start: None,
-            open_simulated_trade: None,
+            lifecycle: if live_synchronized {
+                LifecycleMode::LiveSynchronized {
+                    open_position: None,
+                }
+            } else {
+                LifecycleMode::Replay { open_trade: None }
+            },
         })
+    }
+
+    pub fn notify_live_balance(&mut self, balance: f64) {
+        if matches!(self.lifecycle, LifecycleMode::LiveSynchronized { .. }) {
+            self.risk_gate.update_balance(balance);
+        }
+    }
+
+    pub fn notify_live_trade_opened(
+        &mut self,
+        contract_id: Option<String>,
+        direction: impl Into<String>,
+        stake: f64,
+        timestamp_ms: i64,
+    ) {
+        if let LifecycleMode::LiveSynchronized { open_position } = &mut self.lifecycle {
+            let was_open = open_position.is_some();
+            *open_position = Some(LivePosition {
+                contract_id,
+                direction: direction.into(),
+                stake,
+                opened_at_ms: timestamp_ms,
+            });
+            self.last_trade_time = timestamp_ms;
+            if !was_open {
+                self.risk_gate.on_trade_opened();
+            }
+        }
+    }
+
+    pub fn notify_live_trade_closed(
+        &mut self,
+        pnl: f64,
+        timestamp_ms: i64,
+        realized_balance: Option<f64>,
+    ) {
+        if let LifecycleMode::LiveSynchronized { open_position } = &mut self.lifecycle {
+            if open_position.take().is_some() {
+                self.risk_gate.on_trade_closed(pnl, UnixMs(timestamp_ms));
+            }
+            if let Some(balance) = realized_balance {
+                self.risk_gate.update_balance(balance);
+            }
+        }
+    }
+
+    pub fn notify_live_trade_aborted(&mut self, timestamp_ms: i64, balance: Option<f64>) {
+        if let LifecycleMode::LiveSynchronized { open_position } = &mut self.lifecycle {
+            if open_position.take().is_some() {
+                self.risk_gate.open_positions = self.risk_gate.open_positions.saturating_sub(1);
+            }
+            self.last_trade_time = timestamp_ms;
+            if let Some(balance) = balance {
+                self.risk_gate.update_balance(balance);
+            }
+        }
+    }
+
+    pub fn set_live_position_open(&mut self, is_open: bool) {
+        if let LifecycleMode::LiveSynchronized { open_position } = &mut self.lifecycle {
+            match (is_open, open_position.is_some()) {
+                (true, false) => {
+                    *open_position = Some(LivePosition {
+                        contract_id: None,
+                        direction: "UNKNOWN".into(),
+                        stake: 0.0,
+                        opened_at_ms: UnixMs::now().0,
+                    });
+                    self.risk_gate.on_trade_opened();
+                }
+                (false, true) => {
+                    *open_position = None;
+                    self.risk_gate.open_positions = self.risk_gate.open_positions.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn live_position_is_open(&self) -> bool {
+        matches!(
+            &self.lifecycle,
+            LifecycleMode::LiveSynchronized {
+                open_position: Some(_)
+            }
+        )
     }
 
     pub fn step(&mut self, tick: &TickUpdate, execution_enabled: bool) -> Option<DecisionContext> {
@@ -188,8 +302,8 @@ impl DecisionEngine {
             let can = self.risk_gate.can_trade(now);
             if let Err(rej) = can {
                 rejection_reason = Some(rej.to_string());
-            } else if self.open_simulated_trade.is_some() {
-                rejection_reason = Some("simulated_trade_open".to_string());
+            } else if self.has_open_position() {
+                rejection_reason = Some(self.open_position_rejection_reason().to_string());
             } else if (now.0 - self.last_trade_time) <= self.contract_duration as i64 * 1000 {
                 rejection_reason = Some("trade_cooldown_active".to_string());
             } else if proposed_stake < self.min_stake {
@@ -200,12 +314,14 @@ impl DecisionEngine {
                     executed_stake = proposed_stake;
                     self.last_trade_time = now.0;
                     self.risk_gate.on_trade_opened();
-                    self.open_simulated_trade = Some(SimulatedTrade {
-                        entered_at_ms: now.0,
-                        settle_at_ms: now.0 + self.contract_duration as i64 * 1000,
-                        direction: contract.to_string(),
-                        stake: proposed_stake,
-                    });
+                    if let LifecycleMode::Replay { open_trade } = &mut self.lifecycle {
+                        *open_trade = Some(SimulatedTrade {
+                            entered_at_ms: now.0,
+                            settle_at_ms: now.0 + self.contract_duration as i64 * 1000,
+                            direction: contract.to_string(),
+                            stake: proposed_stake,
+                        });
+                    }
                 }
             }
         }
@@ -237,12 +353,29 @@ impl DecisionEngine {
         })
     }
 
+    fn has_open_position(&self) -> bool {
+        match &self.lifecycle {
+            LifecycleMode::Replay { open_trade } => open_trade.is_some(),
+            LifecycleMode::LiveSynchronized { open_position } => open_position.is_some(),
+        }
+    }
+
+    fn open_position_rejection_reason(&self) -> &'static str {
+        match &self.lifecycle {
+            LifecycleMode::Replay { .. } => "simulated_trade_open",
+            LifecycleMode::LiveSynchronized { .. } => "position_already_open",
+        }
+    }
+
     fn maybe_settle_simulated_trade(
         &mut self,
         tick: &TickUpdate,
         now: UnixMs,
     ) -> Option<SimulatedTradeSettlement> {
-        let trade = self.open_simulated_trade.clone()?;
+        let trade = match &self.lifecycle {
+            LifecycleMode::Replay { open_trade } => open_trade.clone()?,
+            LifecycleMode::LiveSynchronized { .. } => return None,
+        };
         if now.0 < trade.settle_at_ms {
             return None;
         }
@@ -253,7 +386,9 @@ impl DecisionEngine {
             trade.stake,
         );
         self.risk_gate.on_trade_closed(pnl, now);
-        self.open_simulated_trade = None;
+        if let LifecycleMode::Replay { open_trade } = &mut self.lifecycle {
+            *open_trade = None;
+        }
         Some(SimulatedTradeSettlement {
             entered_at_ms: trade.entered_at_ms,
             settled_at_ms: now.0,
@@ -370,9 +505,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_execution_closes_positions_and_allows_multiple_trades() {
-        let mut engine = DecisionEngine::new(DecisionEngineConfig {
+    fn replay_engine() -> DecisionEngine {
+        DecisionEngine::new(DecisionEngineConfig {
             symbol: "R_100".into(),
             contract_duration: 5,
             min_stake: 0.35,
@@ -386,7 +520,42 @@ mod tests {
             strategy_mode: "process".into(),
             prior_mode: "process-v1".into(),
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    fn live_engine(balance: f64) -> DecisionEngine {
+        DecisionEngine::new_live(DecisionEngineConfig {
+            symbol: "R_100".into(),
+            contract_duration: 5,
+            min_stake: 0.35,
+            initial_balance: balance,
+            max_open_positions: 1,
+            max_daily_loss: 100.0,
+            cooldown_after_loss_ms: 0,
+            max_consecutive_losses: 10,
+            model_path: None,
+            allow_model_fallback: true,
+            strategy_mode: "process".into(),
+            prior_mode: "process-v1".into(),
+        })
+        .unwrap()
+    }
+
+    fn first_signal(engine: &mut DecisionEngine) -> DecisionContext {
+        for idx in 0..120 {
+            let price = 100.0 + idx as f64 * 0.02;
+            if let Some(ctx) = engine.step(&make_tick(price, idx as i64), false) {
+                if ctx.contract_direction.is_some() {
+                    return ctx;
+                }
+            }
+        }
+        panic!("expected at least one signal");
+    }
+
+    #[test]
+    fn replay_execution_closes_positions_and_allows_multiple_trades() {
+        let mut engine = replay_engine();
 
         let mut enters = 0;
         let mut settlements = 0;
@@ -407,6 +576,89 @@ mod tests {
             settlements >= 1,
             "expected at least one simulated settlement"
         );
+    }
+
+    #[test]
+    fn live_balance_update_changes_kelly_stake_sizing() {
+        let mut engine = live_engine(100.0);
+        let before = first_signal(&mut engine).proposed_stake;
+
+        let mut engine = live_engine(100.0);
+        engine.notify_live_balance(25.0);
+        let after = first_signal(&mut engine).proposed_stake;
+
+        assert!(after < before, "expected {after} < {before}");
+    }
+
+    #[test]
+    fn live_trade_open_blocks_entries_until_close() {
+        let mut engine = live_engine(100.0);
+        let signal = first_signal(&mut engine);
+        engine.notify_live_trade_opened(
+            Some("c1".into()),
+            "CALL",
+            signal.proposed_stake,
+            signal.ts_ms,
+        );
+
+        for idx in 60..120 {
+            if let Some(ctx) = engine.step(&make_tick(101.0 + idx as f64 * 0.01, idx as i64), false)
+            {
+                if ctx.contract_direction.is_some() {
+                    assert_eq!(
+                        ctx.rejection_reason.as_deref(),
+                        Some("position_already_open")
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("expected a blocked signal while live position is open");
+    }
+
+    #[test]
+    fn live_trade_close_reenables_entries() {
+        let mut engine = live_engine(100.0);
+        let signal = first_signal(&mut engine);
+        engine.notify_live_trade_opened(
+            Some("c1".into()),
+            "CALL",
+            signal.proposed_stake,
+            signal.ts_ms,
+        );
+        engine.notify_live_trade_closed(5.0, signal.ts_ms + 6_000, Some(105.0));
+
+        for idx in 70..150 {
+            if let Some(ctx) = engine.step(&make_tick(102.0 + idx as f64 * 0.01, idx as i64), false)
+            {
+                if ctx.contract_direction.is_some()
+                    && ctx.rejection_reason.as_deref() != Some("trade_cooldown_active")
+                {
+                    assert_ne!(
+                        ctx.rejection_reason.as_deref(),
+                        Some("position_already_open")
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("expected live entries to re-enable after close");
+    }
+
+    #[test]
+    fn live_disconnect_abort_clears_open_position_state() {
+        let mut engine = live_engine(100.0);
+        let signal = first_signal(&mut engine);
+        engine.notify_live_trade_opened(
+            Some("c1".into()),
+            "CALL",
+            signal.proposed_stake,
+            signal.ts_ms,
+        );
+        assert!(engine.live_position_is_open());
+
+        engine.notify_live_trade_aborted(signal.ts_ms + 1_000, Some(100.0));
+        assert!(!engine.live_position_is_open());
     }
 
     #[test]

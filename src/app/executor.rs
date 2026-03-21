@@ -40,7 +40,7 @@ pub async fn run_executor() -> anyhow::Result<()> {
 }
 
 pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
-    let mut engine = DecisionEngine::new(DecisionEngineConfig {
+    let mut engine = DecisionEngine::new_live(DecisionEngineConfig {
         symbol: cfg.symbol.clone(),
         contract_duration: cfg.contract_duration,
         min_stake: cfg.min_stake,
@@ -136,6 +136,7 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                     match response {
                         DerivResponse::Authorize { balance, currency, login_id } => {
                             info!(login_id = %login_id, balance, currency = %currency, "Authorized executor session");
+                            engine.notify_live_balance(balance);
                             ws_client.set_state(ConnectionState::Authorized).await;
                             let _ = router.send_fire(protocol::requests::ticks(&cfg.symbol)).await;
                             let _ = router.send_fire(protocol::requests::balance_subscribe()).await;
@@ -157,18 +158,31 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                     if let Some(contract_type) = parse_contract_direction(decision.contract_direction.as_deref()) {
                                         match trader.enter_trade(&SymbolId(cfg.symbol.clone()), contract_type, decision.proposed_stake, cfg.contract_duration, &cfg.duration_unit).await {
                                             Ok(()) => {
-                                                metrics.inc_trades();
-                                                ledger.on_buy(contract_type, decision.proposed_stake);
-                                                if let Some(ref db) = db {
-                                                    pending_execution = persist_live_execution_open(
-                                                        db,
-                                                        &run_id,
-                                                        &decision,
-                                                        contract_type,
-                                                        &trader,
-                                                    ).ok();
+                                                if trader.current_state() == TradeState::Open {
+                                                    metrics.inc_trades();
+                                                    ledger.on_buy(contract_type, decision.proposed_stake);
+                                                    let opened_at_ms = UnixMs::now().0;
+                                                    let contract_id = trader.active_trade.as_ref().and_then(|t| t.contract_id.clone());
+                                                    engine.notify_live_trade_opened(
+                                                        contract_id,
+                                                        contract_type.to_string(),
+                                                        decision.proposed_stake,
+                                                        opened_at_ms,
+                                                    );
+                                                    if let Some(ref db) = db {
+                                                        pending_execution = persist_live_execution_open(
+                                                            db,
+                                                            &run_id,
+                                                            &decision,
+                                                            contract_type,
+                                                            &trader,
+                                                        ).ok();
+                                                    }
+                                                    info!(regime = %decision.regime, q_final = decision.q_final, edge = decision.edge, benchmark_signal = %decision.benchmark_signal, contract = %decision.contract_direction.as_deref().unwrap_or("NONE"), "DecisionEngine trade entered");
+                                                } else {
+                                                    info!(state = ?trader.current_state(), "Trade request completed without an open live contract; skipping live-open synchronization");
+                                                    trader.reset();
                                                 }
-                                                info!(regime = %decision.regime, q_final = decision.q_final, edge = decision.edge, benchmark_signal = %decision.benchmark_signal, contract = %decision.contract_direction.as_deref().unwrap_or("NONE"), "DecisionEngine trade entered");
                                             }
                                             Err(e) => {
                                                 error!(error = %e, edge = decision.edge, proposed_stake = decision.proposed_stake, "Trade execution failed");
@@ -208,12 +222,12 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                                             continue;
                                         }
                                     };
-                                    settle_live_trade(&mut pending_execution, &db, &trader, pnl, "closed_early", Some("stop_loss_exit"), &metrics, &mut ledger);
+                                    settle_live_trade(&mut engine, &mut pending_execution, &db, &trader, pnl, "closed_early", Some("stop_loss_exit"), &metrics, &mut ledger);
                                     trader.reset();
                                     info!(contract_id = %cid, pnl, "Contract sold early after early-exit loss threshold");
                                 }
                                 PocAction::Settled(pnl) => {
-                                    settle_live_trade(&mut pending_execution, &db, &trader, pnl, "settled", Some("contract_expired"), &metrics, &mut ledger);
+                                    settle_live_trade(&mut engine, &mut pending_execution, &db, &trader, pnl, "settled", Some("contract_expired"), &metrics, &mut ledger);
                                     trader.reset();
                                     info!(contract_id = %contract_id, profit = pnl, "Contract settled naturally");
                                 }
@@ -221,6 +235,7 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                             }
                         }
                         DerivResponse::Balance { balance, currency } => {
+                            engine.notify_live_balance(balance);
                             debug!(balance, currency = %currency, "Balance update");
                         }
                         DerivResponse::Time { server_time } => {
@@ -276,6 +291,7 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                     );
                 }
             }
+            engine.notify_live_trade_aborted(UnixMs::now().0, None);
             trader.abort("Disconnect");
             trader.reset();
         }
@@ -515,6 +531,7 @@ fn persist_live_execution_open(
 }
 
 fn settle_live_trade(
+    engine: &mut DecisionEngine,
     pending_execution: &mut Option<PendingExecutionTelemetry>,
     db: &Option<Arc<TelemetryDb>>,
     trader: &Trader,
@@ -536,6 +553,7 @@ fn settle_live_trade(
             .and_then(|t| t.payout)
             .map(|p| if pnl > 0.0 { p } else { 0.0 });
         ledger.on_settle(pending.contract_type, payout.unwrap_or(0.0), pending.stake);
+        engine.notify_live_trade_closed(pnl, UnixMs::now().0, Some(ledger.cash));
         if let Some(db) = db {
             let _ =
                 db.update_trade_intent_status(pending.intent_id, "executed", pending.stake, None);
@@ -617,6 +635,71 @@ mod tests {
             1
         );
         assert_eq!(db.count_rows("executed_trades", "live-fail").unwrap(), 0);
+    }
+
+    #[test]
+    fn settle_live_trade_clears_engine_open_state() {
+        let mut engine = DecisionEngine::new_live(DecisionEngineConfig {
+            symbol: "R_100".into(),
+            contract_duration: 5,
+            min_stake: 0.35,
+            initial_balance: 100.0,
+            max_open_positions: 1,
+            max_daily_loss: 100.0,
+            cooldown_after_loss_ms: 0,
+            max_consecutive_losses: 10,
+            model_path: None,
+            allow_model_fallback: true,
+            strategy_mode: "process".into(),
+            prior_mode: "process-v1".into(),
+        })
+        .unwrap();
+        engine.notify_live_trade_opened(Some("c_123".into()), "CALL", 1.2, 10);
+
+        let router = Arc::new(Router::new(tokio::sync::mpsc::channel(1).0));
+        let trader = Trader {
+            router,
+            active_trade: Some(crate::execution::trader::ActiveTrade {
+                state: TradeState::Open,
+                symbol: SymbolId("R_100".into()),
+                contract_type: ContractType::Call,
+                stake: 1.2,
+                duration_sec: 5,
+                duration_unit: "s".into(),
+                proposal_id: None,
+                contract_id: Some("c_123".into()),
+                buy_price: Some(1.2),
+                payout: Some(2.34),
+                subscription_id: None,
+                created_at: UnixMs(10),
+            }),
+            dry_run: false,
+            stop_loss_pct: 0.5,
+        };
+        let metrics = Metrics::new();
+        let mut ledger = Ledger::new(100.0);
+        ledger.on_buy(ContractType::Call, 1.2);
+        let mut pending = Some(PendingExecutionTelemetry {
+            intent_id: 1,
+            executed_trade_id: 1,
+            stake: 1.2,
+            contract_type: ContractType::Call,
+        });
+
+        settle_live_trade(
+            &mut engine,
+            &mut pending,
+            &None,
+            &trader,
+            1.14,
+            "settled",
+            Some("contract_expired"),
+            &metrics,
+            &mut ledger,
+        );
+
+        assert!(pending.is_none());
+        assert!(!engine.live_position_is_open());
     }
 
     #[test]
