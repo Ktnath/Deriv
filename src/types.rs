@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyType {
+    Process,
     Temporal,
     Rsi,
     BollingerBands,
@@ -19,6 +20,7 @@ impl FromStr for StrategyType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "process" | "synthetic" | "regime" => Ok(Self::Process),
             "temporal" => Ok(Self::Temporal),
             "rsi" => Ok(Self::Rsi),
             "bb" | "bollinger_bands" | "bollingerbands" => Ok(Self::BollingerBands),

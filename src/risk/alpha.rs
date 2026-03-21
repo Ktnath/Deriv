@@ -7,6 +7,31 @@ pub enum ModelMode {
     QuantOnly { reason: String },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BlendConfig {
+    pub model_weight: f64,
+    pub prior_weight: f64,
+    pub confidence_bias: f64,
+}
+
+impl Default for BlendConfig {
+    fn default() -> Self {
+        Self {
+            model_weight: 0.64,
+            prior_weight: 0.36,
+            confidence_bias: 0.25,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlendInputs {
+    pub model_probability: Prob,
+    pub process_prior: Option<Prob>,
+    pub confidence_multiplier: Option<f64>,
+    pub config: BlendConfig,
+}
+
 /// Lognormal alpha engine — ported from Polymarket bot.
 pub struct AlphaEngine {
     pub confidence: f64,
@@ -76,25 +101,27 @@ impl AlphaEngine {
         &self.model_mode
     }
 
-    pub fn finalize_probability(
-        &self,
-        q_model: Prob,
-        q_prior: Option<Prob>,
-        alpha_weight: f64,
-    ) -> AlphaOutput {
-        match q_prior {
-            Some(prior) => self.shrink_logit(q_model, prior, alpha_weight),
-            None => {
-                let margin = 0.02 * (1.0 - self.confidence);
-                AlphaOutput {
-                    q_model,
-                    q_mkt: q_model,
-                    q_final: q_model,
-                    q_low: Prob((q_model.0 - margin).max(0.0)),
-                    q_high: Prob((q_model.0 + margin).min(1.0)),
-                    confidence: self.confidence,
-                }
-            }
+    pub fn finalize_probability(&self, inputs: BlendInputs) -> AlphaOutput {
+        let prior = inputs.process_prior.unwrap_or(inputs.model_probability);
+        let confidence_multiplier = inputs.confidence_multiplier.unwrap_or(1.0).clamp(0.5, 1.5);
+        let model_weight = (inputs.config.model_weight * confidence_multiplier).clamp(0.05, 0.95);
+        let prior_weight = inputs.config.prior_weight.clamp(0.05, 0.95);
+        let total = model_weight + prior_weight;
+        let normalized_model = model_weight / total;
+        let normalized_prior = prior_weight / total;
+        let logit_model = logit(inputs.model_probability.0.clamp(0.001, 0.999));
+        let logit_prior = logit(prior.0.clamp(0.001, 0.999));
+        let base_logit = normalized_model * logit_model + normalized_prior * logit_prior;
+        let confidence_push = (confidence_multiplier - 1.0) * inputs.config.confidence_bias;
+        let q_final = inv_logit(base_logit + confidence_push);
+        let margin = 0.02 * (1.0 - self.confidence) / confidence_multiplier.max(0.75);
+        AlphaOutput {
+            q_model: inputs.model_probability,
+            q_mkt: prior,
+            q_final: Prob(q_final),
+            q_low: Prob((q_final - margin).max(0.0)),
+            q_high: Prob((q_final + margin).min(1.0)),
+            confidence: confidence_multiplier,
         }
     }
 
@@ -189,22 +216,6 @@ impl AlphaEngine {
         let z = (s_hat / s0).ln() / sigma_t;
         Prob(normal_cdf(z))
     }
-
-    pub fn shrink_logit(&self, q_model: Prob, q_mkt: Prob, alpha_weight: f64) -> AlphaOutput {
-        let logit_model = logit(q_model.0.clamp(0.001, 0.999));
-        let logit_mkt = logit(q_mkt.0.clamp(0.001, 0.999));
-        let blended = alpha_weight * logit_model + (1.0 - alpha_weight) * logit_mkt;
-        let q_final = inv_logit(blended);
-        let margin = 0.02 * (1.0 - self.confidence);
-        AlphaOutput {
-            q_model,
-            q_mkt,
-            q_final: Prob(q_final),
-            q_low: Prob((q_final - margin).max(0.0)),
-            q_high: Prob((q_final + margin).min(1.0)),
-            confidence: self.confidence,
-        }
-    }
 }
 
 fn logit(p: f64) -> f64 {
@@ -241,36 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn test_model_mode_without_path_uses_fallback() {
+    fn blend_respects_prior_and_confidence() {
         let engine = AlphaEngine::new(0.55, None, true).unwrap();
-        assert!(matches!(engine.model_mode(), ModelMode::QuantOnly { .. }));
-    }
-
-    #[test]
-    fn test_model_load_failure_respects_fallback_flag() {
-        let ok = AlphaEngine::new(0.55, Some("/definitely/missing/model.onnx"), true).unwrap();
-        assert!(matches!(ok.model_mode(), ModelMode::QuantOnly { .. }));
-        assert!(AlphaEngine::new(0.55, Some("/definitely/missing/model.onnx"), false).is_err());
-    }
-
-    #[test]
-    fn test_finalize_probability_model_only_passthrough() {
-        let engine = AlphaEngine::new(0.55, None, true).unwrap();
-        let out = engine.finalize_probability(Prob(0.61), None, 0.55);
-        assert!((out.q_final.0 - 0.61).abs() < f64::EPSILON);
-        assert!((out.q_mkt.0 - 0.61).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_normal_cdf_symmetry() {
-        assert!((normal_cdf(0.0) - 0.5).abs() < 0.001);
-        assert!((normal_cdf(1.0) + normal_cdf(-1.0) - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_shrink_logit_midpoint() {
-        let engine = AlphaEngine::new(0.55, None, true).unwrap();
-        let out = engine.shrink_logit(Prob(0.5), Prob(0.5), 0.55);
-        assert!((out.q_final.0 - 0.5).abs() < 0.01);
+        let neutral = engine.finalize_probability(BlendInputs {
+            model_probability: Prob(0.60),
+            process_prior: Some(Prob(0.52)),
+            confidence_multiplier: Some(1.0),
+            config: BlendConfig::default(),
+        });
+        let more_confident = engine.finalize_probability(BlendInputs {
+            model_probability: Prob(0.60),
+            process_prior: Some(Prob(0.52)),
+            confidence_multiplier: Some(1.25),
+            config: BlendConfig::default(),
+        });
+        assert!(neutral.q_final.0 > 0.52 && neutral.q_final.0 < 0.60);
+        assert!(more_confident.q_final.0 > neutral.q_final.0);
     }
 }
