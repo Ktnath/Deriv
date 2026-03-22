@@ -389,14 +389,14 @@ impl TelemetryDb {
 
     pub fn regime_counts(&self, run_id: &str) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare("SELECT regime, COUNT(*) FROM decision_events WHERE run_id = ?1 GROUP BY regime ORDER BY COUNT(*) DESC, regime")?;
-        stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect()
+        let rows = stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 
     pub fn rejection_counts(&self, run_id: &str) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare("SELECT COALESCE(rejection_reason, 'none'), COUNT(*) FROM decision_events WHERE run_id = ?1 GROUP BY COALESCE(rejection_reason, 'none') ORDER BY COUNT(*) DESC, 1")?;
-        stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect()
+        let rows = stmt.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 
     pub fn win_loss_summary(&self, run_id: &str) -> Result<(i64, i64, f64)> {
@@ -614,7 +614,7 @@ mod tests {
     fn submitted_intent_can_create_executed_trade_and_reports_it() {
         let db = TelemetryDb::new(":memory:").unwrap();
         db.upsert_run_metadata(&RunMetadata {
-            run_id: "r1",
+            run_id: "r1".into(),
             binary_type: "research".into(),
             model_version: "quant-only".into(),
             strategy_version: "process".into(),

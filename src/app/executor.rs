@@ -303,11 +303,10 @@ pub async fn run_live_executor(cfg: ExecutorConfig) -> anyhow::Result<()> {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    if let Ok(req_id) = router.next_req_id().await.try_into() {
-                        if let Err(e) = WsClient::send_ping(&write_tx, req_id).await {
-                            warn!(error = %e, "Ping failed, reconnecting");
-                            break "Ping send failed";
-                        }
+                    let req_id: u64 = router.next_req_id().await;
+                    if let Err(e) = WsClient::send_ping(&write_tx, req_id.try_into().unwrap_or(0)).await {
+                        warn!(error = %e, "Ping failed, reconnecting");
+                        break "Ping send failed";
                     }
                 }
             }

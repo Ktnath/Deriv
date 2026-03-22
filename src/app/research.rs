@@ -6,7 +6,6 @@ use crate::{
     observability::db::{
         ExecutedTradeRecord, RunDecisionRecord, RunMetadata, TelemetryDb, TradeIntentRecord,
     },
-    process::Regime,
     types::TickUpdate,
 };
 use chrono::{TimeZone, Utc};
@@ -377,6 +376,7 @@ impl ResearchConfig {
 mod tests {
     use super::*;
     use crate::observability::db::TelemetryDb;
+    use crate::process::Regime;
 
     #[test]
     fn parse_known_commands() {
@@ -446,6 +446,7 @@ mod tests {
                 strategy_mode: "strategy-v1".into(),
                 model_metadata: "quant-only".into(),
                 feature_summary: "{}".into(),
+                simulated_trade_closed: None,
             },
         )
         .unwrap();

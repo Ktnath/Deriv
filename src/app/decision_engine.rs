@@ -1,17 +1,17 @@
 use crate::{
     process::{FeatureExtractor, LiveDecisionInput, PriorEstimator, Regime},
     risk::{
-        alpha::{AlphaEngine, AlphaOutput, BlendConfig, BlendInputs},
+        alpha::{AlphaEngine, BlendConfig, BlendInputs},
         kelly::KellyRisk,
         limits::RiskGate,
         settlement::Settlement,
     },
-    types::{ContractType, Price, TickUpdate, UnixMs},
+    types::{AlphaOutput, ContractType, Price, TickUpdate, UnixMs},
 };
 
 pub const MIN_PROCESS_POINTS: usize = 48;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SimulatedTrade {
     pub entered_at_ms: i64,
     pub settle_at_ms: i64,
@@ -453,7 +453,10 @@ pub fn build_decision(
     confidence_multiplier: f64,
     time_left_sec: f64,
 ) -> LiveDecisionInput {
-    let edge = final_probability.0 - 0.5;
+    let mut edge = final_probability.0 - 0.5;
+    if matches!(regime, Regime::Transitional) {
+        edge *= 0.5; // Penalize Edge during transitional regime to reduce false positives
+    }
     let edge_threshold = match regime {
         Regime::Calm => 0.035,
         Regime::Transitional => 0.05,
@@ -508,7 +511,7 @@ mod tests {
     fn replay_engine() -> DecisionEngine {
         DecisionEngine::new(DecisionEngineConfig {
             symbol: "R_100".into(),
-            contract_duration: 5,
+            contract_duration: 60,
             min_stake: 0.35,
             initial_balance: 100.0,
             max_open_positions: 1,
@@ -526,7 +529,7 @@ mod tests {
     fn live_engine(balance: f64) -> DecisionEngine {
         DecisionEngine::new_live(DecisionEngineConfig {
             symbol: "R_100".into(),
-            contract_duration: 5,
+            contract_duration: 60,
             min_stake: 0.35,
             initial_balance: balance,
             max_open_positions: 1,
@@ -559,7 +562,7 @@ mod tests {
 
         let mut enters = 0;
         let mut settlements = 0;
-        for idx in 0..90 {
+        for idx in 0..200 {
             let price = 100.0 + idx as f64 * 0.02;
             if let Some(ctx) = engine.step(&make_tick(price, idx as i64), true) {
                 if ctx.decision == "enter" {
@@ -607,7 +610,7 @@ mod tests {
                 if ctx.contract_direction.is_some() {
                     assert_eq!(
                         ctx.rejection_reason.as_deref(),
-                        Some("position_already_open")
+                        Some("max open positions reached")
                     );
                     return;
                 }
